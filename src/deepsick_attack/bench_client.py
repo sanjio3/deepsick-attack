@@ -292,7 +292,10 @@ def run_benchmark(solver: Callable[[Challenge, StartResult], list[str]] | None =
                  known=len(seen), listed=len(challenges),
                  note="没有可跑的新题，稍后重新取列表")
             idle_rounds += 1
-            if idle_rounds >= 2:
+            # 一题都没启动过时不要急着退：实例可能还在拉起，平台还没来得及
+            # 把题目挂进来。已经跑过题的话，两轮空转就说明真的没题了。
+            idle_limit = 2 if seen else 40
+            if idle_rounds >= idle_limit:
                 emit("bench_exhausted", known=len(seen), listed=len(challenges))
                 break
             time.sleep(_idle_seconds())
