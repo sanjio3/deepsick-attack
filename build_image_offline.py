@@ -75,7 +75,8 @@ DEFAULT_EXCLUDES = [
 ]
 
 # 容器内需要可执行的文件
-EXECUTABLES = {"run.py", "build_image.sh", "build_image_offline.py"}
+EXECUTABLES = {"run.py", "build_image.sh", "build_image_offline.py",
+               "nmap", "ncat", "socat", "busybox", "curl"}
 
 
 def log(msg: str) -> None:
@@ -360,7 +361,9 @@ def assemble(config: dict, layer_files: list[tuple[str, str, int]],
         cfg = json.loads(json.dumps(config))  # deep copy
         created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         env = cfg["config"].get("Env") or []
-        for kv in ("PYTHONDONTWRITEBYTECODE=1", "PYTHONUNBUFFERED=1", "PYTHONPATH=/app/src:/app/vendor/site-packages"):
+        for kv in ("PYTHONDONTWRITEBYTECODE=1", "PYTHONUNBUFFERED=1",
+                   "PYTHONPATH=/app/src:/app/vendor/site-packages",
+                   "PATH=/app/vendor/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"):
             key = kv.split("=")[0] + "="
             env = [e for e in env if not e.startswith(key)]
             env.append(kv)
@@ -455,7 +458,9 @@ def _image_config(config: dict, diff_ids: list[str]) -> bytes:
     cfg = json.loads(json.dumps(config))
     created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     env = cfg["config"].get("Env") or []
-    for kv in ("PYTHONDONTWRITEBYTECODE=1", "PYTHONUNBUFFERED=1", "PYTHONPATH=/app/src:/app/vendor/site-packages"):
+    for kv in ("PYTHONDONTWRITEBYTECODE=1", "PYTHONUNBUFFERED=1",
+               "PYTHONPATH=/app/src:/app/vendor/site-packages",
+               "PATH=/app/vendor/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"):
         prefix = kv.split("=")[0] + "="
         env = [e for e in env if not e.startswith(prefix)]
         env.append(kv)

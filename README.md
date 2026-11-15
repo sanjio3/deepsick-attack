@@ -146,10 +146,41 @@ flag，每条带 `risk`。给模型看的是事实摘要，不是最近 8 条原
 
 模型输出空 `flags` 不会结束本题，只是被要求继续换候选。
 
+### 执行层（`session.py` + `vendor/bin`）
+
+这一层是读完 CAI 源码后补的，也是最关键的一层。CAI 的 CTF agent 系统提示
+（`src/cai/prompts/system_ctf_agent.md`）里工具只有一个 `generic_linux_command`，真正的
+能力来自它的会话参数：
+
+    generic_linux_command("ssh user@host", interactive=True)   # 起会话
+    generic_linux_command("id", session_id="<id>")             # 往会话里发
+    generic_linux_command("session output <id>")               # 读回来
+
+换句话说，能解题的 agent 不缺「机制」，缺的是**一个能维持状态的 shell**。之前给模型的是
+`http_get` / `http_post` / `tcp_send` 这些一次性原语，反弹 shell、交互式 ssh、nc 传文件、
+python 反向连接，一个都做不了。
+
+所以镜像里现在装的是静态二进制：`nmap`、`ncat`、`socat`、`busybox`、`curl`（
+`vendor/bin/`，全部 ELF64 静态链接，不依赖 glibc 版本，`PATH` 指向 `/app/vendor/bin`）。
+模型的动作也改成命令优先：
+
+    {"cmd": "nmap -sT -Pn -sV -p22,80 10.0.0.5"}          # 跑一条命令
+    {"session": "start", "cmd": "python3 -i"}              # 起会话
+    {"session": "send", "id": 1, "text": "id\n"}           # 发
+    {"session": "read", "id": 1, "wait": 3}                # 读
+    {"flags": ["flag{...}"]}                               # 交卷
+
+会话支持两种后端：本地进程（Linux 上走 pty，保证 ssh/nc 不因 stdout 缓冲卡住）与
+paramiko 的 `invoke_shell` 通道（给只有 `:22` 的题用，镜像里没有 ssh 客户端）。
+`pick` 候选与旧的 `tool/args` 仍保留为兜底。
+
+出口控制照 Cairn 的「受管出口」做：动作串行、最小间隔加随机抖动、连续三次命中主动防御
+话术就熔断该题（`solve_breaker`），避免把「死手」这类题的自毁机制踩爆。
+
 ### 工具集
 
 标准库部分：`http_request`（保持 cookie）、`http_get`、`http_post`、`port_scan`、
-`tcp_send`、`shell`、`decode`、`udp_probe`、`mdns`、`dns_query`。
+`tcp_send`、`shell`、`decode`、`udp_probe`、`mdns`、`dns_query`、`session_*`。
 
 `vendor/` 下的 manylinux 轮子提供 SSH 与 DNS 能力：`ssh_audit`（读版本与允许的认证
 方式）、`ssh_login`（只试 4 组常见口令，不做字典爆破，登录后自动找 flag 文件）。

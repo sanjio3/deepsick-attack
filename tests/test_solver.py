@@ -4,6 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import json
+import re
 import socket
 import tempfile
 import threading
@@ -440,7 +441,7 @@ class SolveChallengeTest(unittest.TestCase):
                 make_challenge(), StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
                 llm, deadline=time.time() + 30, max_steps=3)
             first = llm.prompts[0]
-        self.assertIn("可选动作", first)
+        self.assertIn("候选动作", first)
         self.assertIn("事实板", first)
         self.assertIn("http:%d:home" % srv.port, first)
 
@@ -539,6 +540,80 @@ class SolveChallengeTest(unittest.TestCase):
                 make_challenge(), StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
                 llm, deadline=time.time() + 30, max_steps=2)
         self.assertEqual(len(flags), 15)
+
+
+class SessionTest(unittest.TestCase):
+    """会话是这一版的核心能力：没有它做不了反弹 shell / 交互式 ssh / nc。"""
+
+    def test_start_send_read_roundtrip(self):
+        toolkit = Toolkit(_ctx(1))
+        try:
+            out = toolkit.run("session_start", {"command": "cat", "use_pty": False})
+            self.assertIn("已创建会话", out)
+            sid = int(re.search(r"id=(\d+)", out).group(1))
+            # send 自带一次读取，方便小模型少走一步
+            got = toolkit.run("session_send", {"id": sid, "text": "hello-session"})
+            self.assertIn("hello-session", got)
+            self.assertIn("id=", toolkit.session_list())
+            self.assertIn("已关闭", toolkit.run("session_kill", {"id": sid}))
+            self.assertNotIn("id=", toolkit.session_list())
+        finally:
+            toolkit.sessions.close_all()
+
+    def test_read_captures_late_output(self):
+        """session_read 要能单独拿到「后来才产生」的输出（不靠 send 捎带）。"""
+        toolkit = Toolkit(_ctx(1))
+        try:
+            toolkit.run("session_start",
+                        {"command": "sleep 1; echo delayed-marker", "use_pty": False})
+            got = toolkit.run("session_read", {"id": 1, "wait": 4})
+            self.assertIn("delayed-marker", got)
+        finally:
+            toolkit.sessions.close_all()
+
+    def test_missing_session_is_reported(self):
+        toolkit = Toolkit(_ctx(1))
+        self.assertIn("没有 id=99", toolkit.run("session_read", {"id": 99}))
+
+
+class CmdActionTest(unittest.TestCase):
+    """模型直接写 cmd 跑命令——这是 CAI 式的用法，必须通。"""
+
+    def setUp(self):
+        self.events = []
+        set_sink(self.events.append)
+        self.tmp = tempfile.mktemp()
+        Path(self.tmp).write_text(FLAG, encoding="utf-8")
+
+    def tearDown(self):
+        set_sink(None)
+
+    def test_cmd_runs_shell_and_extracts_flag(self):
+        llm = FakeLLM([json.dumps({"cmd": f"cat {Path(self.tmp).as_posix()}",
+                                   "why": "读文件"})])
+        flags = solve_challenge(
+            make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
+            llm, deadline=time.time() + 30, max_steps=3)
+        self.assertIn(FLAG, flags)
+
+
+class BreakerTest(unittest.TestCase):
+    def setUp(self):
+        self.events = []
+        set_sink(self.events.append)
+
+    def tearDown(self):
+        set_sink(None)
+
+    def test_tripwire_breaker_stops_challenge(self):
+        with _Server() as srv:
+            llm = FakeLLM([json.dumps({"tool": "http_get",
+                                       "args": {"path": "/trap"}})
+                           for _ in range(5)])
+            solve_challenge(
+                make_challenge(), StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
+                llm, deadline=time.time() + 40, max_steps=6)
+        self.assertTrue(any(e["event"] == "solve_breaker" for e in self.events))
 
 
 class AcceptsSubmitTest(unittest.TestCase):

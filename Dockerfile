@@ -2,7 +2,8 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app/src:/app/vendor/site-packages
+    PYTHONPATH=/app/src:/app/vendor/site-packages \
+    PATH=/app/vendor/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
 
 WORKDIR /app
 COPY . /app
@@ -10,7 +11,7 @@ COPY . /app
 # 依赖以 manylinux 轮子的形态随源码走，构建期解包成纯文件目录，不进 pip、不联网。
 # 有网也可以用 vendor/wheels 里同样的轮子离线安装；这里解包是为了零 daemon 构建
 # 与 Docker 构建产出一致。
-RUN python vendor/install_vendor.py
+RUN python vendor/install_vendor.py && chmod +x /app/vendor/bin/*
 
 # 平台在创建跑分任务后自动注入 BENCHMARK_TOKEN 与 BENCHMARK_BASE_URL。
 # 模型凭据通过环境变量 MINIMAX_API_KEY / MINIMAX_BASE_URL 注入，

@@ -21,6 +21,7 @@ from __future__ import annotations
 import http.cookiejar
 import json
 import os
+import random
 import re
 import socket
 import subprocess
@@ -37,14 +38,20 @@ from .events import emit
 from .facts import Fact, FactBoard
 from .flags import extract_flags  # noqa: F401  - 对外兼容旧的 import 路径
 from .playbook import Candidate, detect, propose
+from .session import SessionManager, pty_available
 
 MAX_OBS_CHARS = 2600
 MAX_STEPS_HARD_CAP = 60
 MAX_FLAGS_PER_CHALLENGE = 15
-# 同一主机两次动作之间的最小间隔。主动防御/蜜罐类靶标对高频请求敏感，
-# 打得太急会被判定为扫描器，触发死手这类自毁机制。
+# 同一主机两次动作之间的最小间隔 + 随机抖动。主动防御/蜜罐类靶标对节拍敏感，
+# 均匀的高频请求最容易被判定成扫描器（Cairn 把这套叫「受管出口」）。
 MIN_ACTION_GAP = 0.9
+JITTER = 0.7
+# 连续撞到这么多次主动防御话术就熔断该题，避免把「死手」这类题的自毁机制踩爆。
+TRIPWIRE_BREAKER = 3
 BANNER_CLIP = 700
+# 静态工具放在这里，由镜像构建期铺进 /app/vendor/bin
+TOOL_BIN_DIR = "/app/vendor/bin"
 
 SSH_CREDS = [
     ("root", "root"), ("root", "toor"), ("root", "password"), ("admin", "admin"),
@@ -52,37 +59,37 @@ SSH_CREDS = [
     ("msfadmin", "msfadmin"), ("user", "user"), ("guest", "guest"),
 ]
 
-SYSTEM_PROMPT = """你是一个在隔离沙箱里运行的授权 CTF 解题智能体。目标是从靶标拿到 Flag。
+SYSTEM_PROMPT = """你是一台攻击机上的授权 CTF 操作员。你在一个隔离沙箱里，可以直接跑命令。
 
-每一轮你必须输出**一个 JSON 对象**，不要输出解释性文字。三种形式：
+攻击机上装了：bash、python3、nmap、curl、ncat、socat、busybox（busybox 里带 nc/wget/
+vi 等一整套）。所以你不需要「请求某个接口」，你**直接跑命令**。
 
-1. 从候选里挑一个（推荐，绝大多数情况用这个）：
-{"pick": "候选 id", "thought": "为什么选它"}
-2. 自己写一个动作：
-{"tool": "工具名", "args": {...}, "thought": "为什么"}
-3. 已经拿到 flag，交卷：
-{"flags": ["flag 字符串"], "thought": "从哪里拿到的"}
+每一轮输出**一个** JSON 对象，四选一：
 
-工具清单（自定义动作时用）：
-- http_request {"method":"GET","path":"/x","headers":{},"body":""}  path 可写完整 URL
-- http_get {"path":"/x"} / http_post {"path":"/x","body":"a=1"}
-- port_scan {"ports":[80,443]}  扫指定端口
-- tcp_send {"port":6379,"payload":"PING\\r\\n"}
-- shell {"command":"curl -s http://127.0.0.1/"}  在沙箱内执行
-- decode {"value":"...","kind":"base64|hex|url|rot13"}
-- ssh_audit {"port":22}  读 SSH 版本与允许的认证方式
-- ssh_login {"port":22,"creds":["user:pass"]}  逐个试登录并自动找 flag 文件（最多 4 组）
-- dns_query {"name":"example.com","qtype":"TXT"}
-- udp_probe {"port":5353,"payload_hex":"0000"}  原始 UDP 收发
-- mdns {}  列出 mDNS 公布的服务
-- rescan {}  重新扫端口并抓 banner
+1. 跑一条命令（最常用）：
+{"cmd": "nmap -sT -Pn -sV --version-light -p80,22,30000-30010 10.0.0.5", "why": "先看服务"}
+2. 起一个持久会话（ssh / nc / python 这类要交互的）：
+{"session": "start", "cmd": "python3 -i", "why": "要交互"}
+3. 往已有会话发东西 / 读出来：
+{"session": "send", "id": 1, "text": "id; ls -la /\\n"}
+{"session": "read", "id": 1, "wait": 3}
+{"session": "list"}  {"session": "kill", "id": 1}
+4. 拿到了 Flag 就交卷：
+{"flags": ["flag{...}"], "why": "从 /root/flag.txt 读到"}
 
-判断规则：
-- 优先挑候选，除非候选都不合适。候选是代码根据当前事实生成的，比自由发挥靠谱。
-- 标记 risk=high 的候选说明该服务可能带主动防御，只在没有别的路时才碰。
-- 响应「太配合」（一次请求就给 root、目录整齐得反常）通常是蜜罐，别深挖，换条路。
-- 看到形如 xxx{...} 的可疑串就立刻交卷，不要等确认——平台会给对错反馈。
-- 同一个动作不要重复做，做了也没用。"""
+操作要点：
+- 先摸清服务再打。nmap -sT -Pn 起手（沙箱里没有 raw socket 权限时 -sS 会失败），
+  看到 banner 再决定用 curl / ssh / nc / python 去交互。
+- HTTP 用 `curl -i -sS -m 10 http://HOST:PORT/路径`，别用 -o /dev/null，要看响应头。
+- 只有 :22 的题：ssh 未必装了客户端，用 session start 起 `ssh -o StrictHostKeyChecking=no
+  用户@HOST`（镜像里没 ssh 客户端时改走 ssh_shell 工具），口令从题面或已有事实里取，
+  **不要字典爆破**，这类题集明确考「策略选择」，爆破最容易踩主动防御。
+- 要发反弹 shell、传文件、跑 python 脚本，一律走会话：先 start，再 send，再 read。
+- 命令输出很长时自己用 head/grep/cut 收口，不要把几万行原始输出打出来。
+- 看到形如 xxx{...} 的可疑串立刻交卷，不要反复确认——平台会给对错反馈。
+- 同一个命令不要重复跑；连续两次没进展就换思路（换协议、换端口、换路径、换角度）。
+- 响应里出现「检测到 / blocked / 已被记录 / 蜜罐」这类话术，立刻停手这条线，
+  换个入口，别硬刚。"""
 
 
 @dataclass
@@ -102,6 +109,7 @@ class SolveContext:
     base_url: str = ""
     board: FactBoard | None = None
     observations: list[Observation] = field(default_factory=list)
+    sessions_text: str = ""
     jar: http.cookiejar.CookieJar = field(default_factory=http.cookiejar.CookieJar)
 
 
@@ -140,21 +148,35 @@ class Toolkit:
         self.context = context
         self.shell_timeout = shell_timeout
         self.http_timeout = http_timeout
+        # 持久会话（CAI 的 generic_linux_command interactive 等价物）。
+        # 没有它，反弹 shell / 交互式 ssh / nc 传文件全做不了。
+        self.sessions = SessionManager()
+        self._last_action = 0.0
         # 打靶流量必须直连：环境里的出网代理会把发往靶标的请求也劫持成 502
         self._opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}),
             urllib.request.HTTPCookieProcessor(context.jar),
         )
         self._env_opener = None
-        self._last_action = 0.0
 
     # -- 内部 ------------------------------------------------------
 
     def pace(self) -> None:
+        """受管出口：串行、低频、带抖动。均匀高频最容易被判成扫描器。"""
         gap = time.time() - self._last_action
-        if gap < MIN_ACTION_GAP:
-            time.sleep(MIN_ACTION_GAP - gap)
+        target = MIN_ACTION_GAP + random.uniform(0, JITTER)
+        if gap < target:
+            time.sleep(target - gap)
         self._last_action = time.time()
+
+    def tool_env(self) -> dict:
+        """剥掉代理变量，并把静态工具目录塞进 PATH。"""
+        env = {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
+        path = env.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+        if TOOL_BIN_DIR not in path.split(":"):
+            path = TOOL_BIN_DIR + ":" + path
+        env["PATH"] = path
+        return env
 
     def _absolute(self, path: str) -> str:
         path = str(path or "/").strip()
@@ -389,13 +411,12 @@ class Toolkit:
         command = str(command or "").strip()
         if not command:
             return "command 为空"
-        env = {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
         self.pace()
         try:
             completed = subprocess.run(
                 ["bash", "-lc", command], capture_output=True,
                 timeout=self.shell_timeout, cwd="/tmp", text=True,
-                errors="replace", env=env,
+                errors="replace", env=self.tool_env(),
             )
         except subprocess.TimeoutExpired:
             return f"命令超时（>{self.shell_timeout}s）：{command}"
@@ -403,6 +424,105 @@ class Toolkit:
             return f"命令执行失败: {type(exc).__name__}: {exc}"
         out = (completed.stdout or "") + (completed.stderr or "")
         return self._clip(f"exit={completed.returncode}\n{out or '(无输出)'}")
+
+    # -- 持久会话 --------------------------------------------------
+
+    def session_start(self, command: str = "", use_pty: bool = True) -> str:
+        command = str(command or "").strip()
+        if not command:
+            return "command 为空"
+        self.pace()
+        # 单条程序才加 exec（省一层 shell、信号更直接）；带管道/分号/重定向的复合
+        # 命令不能加 exec，否则 exec 把 shell 替换掉，后面的命令永远不会执行。
+        wrapped = (command if re.search(r"[;&|<>`$]", command)
+                   else f"exec {command}")
+        argv = ["bash", "-lc", wrapped]
+        try:
+            session = self.sessions.start(argv, use_pty=use_pty and pty_available(),
+                                          env=self.tool_env())
+        except Exception as exc:  # noqa: BLE001
+            return f"会话启动失败: {type(exc).__name__}: {exc}"
+        time.sleep(0.6)
+        head = session.read(wait=1.2)
+        return (f"已创建会话 id={session.sid}，命令：{command}\n"
+                f"（用 {{\"session\":\"send\",\"id\":{session.sid},...}} 发送，"
+                f"{{\"session\":\"read\",\"id\":{session.sid}}} 读取）\n"
+                f"初始输出：\n{self._clip(head) if head else '(暂无输出)'}")
+
+    def session_send(self, id: int = 0, text: str = "", wait: float = 0.0) -> str:
+        session = self.sessions.get(id)
+        if session is None:
+            return f"没有 id={id} 的会话。当前会话：{self.sessions.list()}"
+        payload = str(text or "")
+        if payload and not payload.endswith("\n"):
+            payload += "\n"
+        self.pace()
+        try:
+            session.write(payload)
+        except Exception as exc:  # noqa: BLE001
+            return f"写入会话 {id} 失败: {type(exc).__name__}: {exc}"
+        if wait:
+            time.sleep(min(float(wait), 10))
+        out = session.read(wait=2.0)
+        return self._clip(f"会话 {id} 输出：\n{out or '(暂无新输出)'}")
+
+    def session_read(self, id: int = 0, wait: float = 2.0) -> str:
+        session = self.sessions.get(id)
+        if session is None:
+            return f"没有 id={id} 的会话。当前会话：{self.sessions.list()}"
+        out = session.read(wait=min(float(wait or 2.0), 15))
+        state = "存活" if session.alive() else "已退出"
+        return self._clip(f"会话 {id}（{state}）输出：\n{out or '(暂无新输出)'}")
+
+    def session_list(self) -> str:
+        rows = self.sessions.list()
+        if not rows:
+            return "当前没有会话。要用交互式命令（ssh/nc/python）先 session_start。"
+        return "\n".join(f"id={r['id']} {'存活' if r['alive'] else '已退出'} "
+                          f"{r['age']}s  {r['cmd']}" for r in rows)
+
+    def session_kill(self, id: int = 0) -> str:
+        return (f"已关闭会话 {id}" if self.sessions.kill(id)
+                else f"没有 id={id} 的会话")
+
+    def ssh_shell(self, port: int = 22, user: str = "", password: str = "",
+                  command: str = "") -> str:
+        """用 paramiko 开一个真正的交互 shell（镜像里没有 ssh 客户端）。"""
+        host = self.context.host
+        try:
+            import paramiko  # type: ignore
+        except ImportError:
+            return "paramiko 不可用，无法开 SSH 会话"
+        if not user:
+            return "需要 user（可选 password）"
+        self.pace()
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            client.connect(host, port=int(port), username=user,
+                           password=password or None, timeout=8,
+                           banner_timeout=8, auth_timeout=8,
+                           allow_agent=False, look_for_keys=False)
+        except Exception as exc:  # noqa: BLE001
+            return f"SSH 登录失败 {user}@{host}:{port}: {type(exc).__name__}: {exc}"
+        if command:
+            try:
+                _, stdout, stderr = client.exec_command(command, timeout=25)
+                out = stdout.read().decode("utf-8", "replace")
+                err = stderr.read().decode("utf-8", "replace")
+            finally:
+                client.close()
+            return self._clip(f"SSH {user}@{host} 执行 {command}\nexit0\n{out}{err}")
+        try:
+            channel = client.invoke_shell(width=200, height=50)
+        except Exception as exc:  # noqa: BLE001
+            client.close()
+            return f"打开 SSH shell 失败: {type(exc).__name__}: {exc}"
+        session = self.sessions.attach(channel, f"ssh {user}@{host}:{port}")
+        time.sleep(1.0)
+        head = session.read(wait=1.5)
+        return (f"SSH 会话已建立 id={session.sid}（{user}@{host}:{port}）\n"
+                f"用 session_send 发命令，session_read 读结果\n{self._clip(head)}")
 
     def decode(self, value: str = "", kind: str = "base64") -> str:
         import base64
@@ -431,6 +551,9 @@ class Toolkit:
         "ssh_audit": "ssh_audit", "ssh_login": "ssh_login",
         "dns_query": "dns_query", "udp_probe": "udp_probe",
         "mdns": "mdns", "rescan": "rescan",
+        "session_start": "session_start", "session_send": "session_send",
+        "session_read": "session_read", "session_list": "session_list",
+        "session_kill": "session_kill", "ssh_shell": "ssh_shell",
     }
 
     def run(self, tool: str, args: dict) -> str:
@@ -531,24 +654,33 @@ def _build_pick_prompt(challenge: Challenge, context: SolveContext) -> str:
         "## 题面",
         challenge.description.strip() or "（平台未给出题面，只能靠主动侦察）",
         "",
+        "## 靶标",
+        f"host = {context.host}",
+        f"平台给的端口 = {context.hint_ports or '(未给)'}",
+        f"当前 Web 入口 = {context.base_url or '(未发现)'}",
+        "",
         "## 事实板（代码已核实的观测结论）",
         board.snapshot() if board else "（空）",
         "",
-        "## 可选动作",
+        "## 会话",
+        context.sessions_text or "（没有活跃会话）",
+        "",
+        "## 候选动作（不知道做什么时从这里挑，也可以直接写 cmd）",
     ]
     if candidates:
         lines += [item.line() for item in candidates]
     else:
-        lines.append("- 没有可用候选，请自己写动作")
+        lines.append("- 没有可用候选，直接写命令")
     recent = context.observations[-3:]
     if recent:
         lines += ["", "## 最近几步原始观测"]
         for obs in recent:
             body = obs.output
-            if len(body) > 900:
-                body = body[:900] + "..."
-            lines.append(f"### 第 {obs.step} 步 {obs.tool}({json.dumps(obs.args, ensure_ascii=False)[:120]})\n{body}")
-    lines += ["", "输出一个 JSON 对象。优先 pick 候选。"]
+            if len(body) > 1400:
+                body = body[:1400] + "..."
+            lines.append(f"### 第 {obs.step} 步 {obs.tool}"
+                         f"({json.dumps(obs.args, ensure_ascii=False)[:120]})\n{body}")
+    lines += ["", "输出一个 JSON 对象。能跑命令就别挑候选。"]
     return "\n".join(lines)
 
 
@@ -651,16 +783,22 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
         emit("solve_blind", unique_code=challenge.unique_code,
              note="端口扫描未发现任何服务，本题可能不可达")
 
-    # ---- 阶段二：候选意图循环 ----
+    # ---- 阶段二：命令/会话循环 ----
     last_tool = ""
     repeat = 0
+    tripwires = 0
     for step in range(1, steps + 1):
         if time.time() >= deadline:
             emit("solve_timeout", unique_code=challenge.unique_code, step=step)
             break
         if len(verified) >= max(1, challenge.flag_count or 1):
             break
+        if tripwires >= TRIPWIRE_BREAKER:
+            emit("solve_breaker", unique_code=challenge.unique_code, step=step,
+                 note=f"连续 {tripwires} 次命中主动防御话术，本题熔断")
+            break
 
+        context.sessions_text = toolkit.session_list()
         prompt = _build_pick_prompt(challenge, context)
         started_at = time.time()
         try:
@@ -677,36 +815,60 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
                  raw=text[:200])
             continue
 
-        thought = str(action.get("thought") or "")[:300]
+        thought = str(action.get("thought") or action.get("why") or "")[:300]
 
         # 交卷：疑似即提交，不等确认
-        if "flags" in action and "pick" not in action and "tool" not in action:
+        if "flags" in action and not any(
+                k in action for k in ("cmd", "session", "tool", "pick")):
             claimed = [str(f).strip() for f in (action.get("flags") or [])
                        if str(f).strip()]
             if not claimed:
                 context.observations.append(Observation(
                     step, "(没收工)", {}, "你还没交任何 flag。若确实拿不到，"
-                    "继续换候选；不要输出空 flags。", time.time() - started_at))
+                    "继续换思路（换协议/换端口/换路径）；不要输出空 flags。",
+                    time.time() - started_at))
                 continue
+            corpus = "\n".join(o.output for o in context.observations)
             for flag in claimed:
-                submit_flag(flag, step, "模型声明")
+                source = "模型声明(有出处)" if flag in corpus else "模型声明(无出处)"
+                submit_flag(flag, step, source)
             emit("solve_final", unique_code=challenge.unique_code, step=step,
                  thought=thought, verified=len(verified))
             break
 
-        # 挑候选
-        candidate: Candidate | None = None
-        if action.get("pick"):
+        # 解析动作。cmd / session 是一等公民，pick 与 tool 是兜底。
+        tool, args, label = "", {}, ""
+        if action.get("cmd"):
+            tool, args = "shell", {"command": str(action["cmd"])}
+        elif action.get("session"):
+            kind = str(action["session"]).lower()
+            if kind == "start":
+                tool = "session_start"
+                args = {"command": str(action.get("cmd") or action.get("command") or "")}
+            elif kind == "send":
+                tool = "session_send"
+                args = {"id": action.get("id", 0), "text": str(action.get("text") or "")}
+            elif kind == "read":
+                tool = "session_read"
+                args = {"id": action.get("id", 0), "wait": action.get("wait", 2)}
+            elif kind == "kill":
+                tool = "session_kill"
+                args = {"id": action.get("id", 0)}
+            else:
+                tool, args = "session_list", {}
+        elif action.get("pick"):
             pick = str(action["pick"])
-            candidate = next((c for c in propose(board, 12) if c.id == pick), None)
+            candidate: Candidate | None = next(
+                (c for c in propose(board, 14) if c.id == pick), None)
             if candidate is None:
                 emit("solve_bad_pick", unique_code=challenge.unique_code,
                      step=step, pick=pick)
                 context.observations.append(Observation(
-                    step, "(无效候选)", {}, f"候选 {pick} 不存在或已试过，"
-                    "请从当前列表里挑一个。", time.time() - started_at))
+                    step, "(无效候选)", {}, f"候选 {pick} 不存在或已试过。"
+                    "要么从当前列表里挑，要么直接写 cmd 跑命令。",
+                    time.time() - started_at))
                 continue
-            tool, args = candidate.tool, candidate.args
+            tool, args, label = candidate.tool, candidate.args, candidate.id
             board.mark_tried(candidate.id)
         else:
             tool = str(action.get("tool") or "")
@@ -714,7 +876,7 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
 
         if tool == "custom":
             context.observations.append(Observation(
-                step, "(要求自定义)", {}, "请直接输出 {\"tool\":...,\"args\":{...}}。",
+                step, "(要求自定义)", {}, "直接写 {\"cmd\": \"要跑的命令\"}。",
                 time.time() - started_at))
             continue
 
@@ -732,14 +894,17 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
         for flag in probe.flags:
             submit_flag(flag, step, f"{tool} 响应提取")
         if probe.tripwire:
+            tripwires += 1
             board.flag_honeypot(f"{host}:{args.get('port', '')}".rstrip(":"))
             emit("solve_tripwire", unique_code=challenge.unique_code, step=step,
-                 marker=probe.tripwire, tool=tool)
+                 marker=probe.tripwire, tool=tool, count=tripwires)
+        else:
+            tripwires = 0
         if probe.too_easy:
             emit("solve_too_easy", unique_code=challenge.unique_code, step=step,
                  marker=probe.too_easy, note="响应过于配合，疑似蜜罐")
 
-        # 重复动作检测：连续三次一样就强制换路
+        # 重复动作检测：连续三次一样就强制换路（模型很容易陷在同一个 curl 里）
         signature = f"{tool}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
         repeat = repeat + 1 if signature == last_tool else 1
         last_tool = signature
@@ -747,8 +912,12 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
             emit("solve_loop_guard", unique_code=challenge.unique_code, step=step,
                  tool=tool)
             repeat = 0
-            board.mark_tried(f"{tool}:{step}", ok=False)
+            context.observations.append(Observation(
+                step, "(重复了)", {},
+                "你连续三次跑同一个动作，不会有新信息。换端口、换协议、换路径，"
+                "或者换一种利用方式。", time.time() - started_at))
 
+    toolkit.sessions.close_all()
     emit("solve_done", unique_code=challenge.unique_code,
          steps=len(context.observations), flags=len(verified),
          **board.stats())
