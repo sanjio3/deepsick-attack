@@ -564,9 +564,11 @@ class SessionTest(unittest.TestCase):
         """session_read 要能单独拿到「后来才产生」的输出（不靠 send 捎带）。"""
         toolkit = Toolkit(_ctx(1))
         try:
+            # 3 秒后才出输出：要晚于 session_start 自带的初始读取窗口（约 1.8s），
+            # 否则会被初始读取吃掉，测不到「后来才产生」这条路径。
             toolkit.run("session_start",
-                        {"command": "sleep 1; echo delayed-marker", "use_pty": False})
-            got = toolkit.run("session_read", {"id": 1, "wait": 4})
+                        {"command": "sleep 3; echo delayed-marker", "use_pty": False})
+            got = toolkit.run("session_read", {"id": 1, "wait": 6})
             self.assertIn("delayed-marker", got)
         finally:
             toolkit.sessions.close_all()
@@ -629,6 +631,35 @@ class RepeatBlockTest(unittest.TestCase):
                         llm, deadline=time.time() + 40, max_steps=2)
         self.assertTrue(any("已经跑过的动作" in p for p in llm.prompts),
                         "第二轮提示词里必须能看到已跑过的命令")
+
+
+class UrlDedupeTest(unittest.TestCase):
+    """同一个 URL 抓第三次要拦。
+
+    平台实跑轨迹里 app.js 被读了 8 遍（第 46/47/49/51/52/53 步），每次换一种
+    python 写法，逐字去重拦不住。
+    """
+
+    def setUp(self):
+        self.events = []
+        set_sink(self.events.append)
+        self.counter = tempfile.mktemp()
+
+    def tearDown(self):
+        set_sink(None)
+
+    def test_third_fetch_of_same_url_is_blocked(self):
+        target = "http://127.0.0.1:1/assets/app.js"
+        cmds = [f"echo fetch1 >> {Path(self.counter).as_posix()}; curl -s -m 2 {target} >/dev/null",
+                f"echo fetch2 >> {Path(self.counter).as_posix()}; python3 -c \"import urllib.request;urllib.request.urlopen('{target}',timeout=2)\"",
+                f"echo fetch3 >> {Path(self.counter).as_posix()}; wget -q -O- {target} || true"]
+        llm = FakeLLM([json.dumps({"cmd": c}) for c in cmds])
+        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
+                        llm, deadline=time.time() + 60, max_steps=3)
+        lines = Path(self.counter).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 2, f"第三次抓同一 URL 仍被执行：{len(lines)} 次")
+        self.assertTrue(any(e["event"] == "solve_repeat_blocked"
+                            and e.get("kind") == "这组 URL" for e in self.events))
 
 
 class BreakerTest(unittest.TestCase):

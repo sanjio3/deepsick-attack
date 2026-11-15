@@ -7,10 +7,14 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from typing import Any, Callable
 
 Sink = Callable[[dict[str, Any]], None]
 _sink: Sink | None = None
+# 并发跑多题时三个线程都会 emit，不加锁会出现两行 JSON 首尾粘在一起，
+# 容器日志被切坏就没法用来复盘。
+_emit_lock = threading.Lock()
 
 
 def set_sink(sink: Sink | None) -> None:
@@ -32,5 +36,7 @@ def emit(event: str, **payload: Any) -> dict[str, Any]:
             sys.stdout.reconfigure(encoding="utf-8")
         except Exception:
             pass
-        print(json.dumps(record, ensure_ascii=False, default=str), flush=True)
+        line = json.dumps(record, ensure_ascii=False, default=str)
+        with _emit_lock:
+            print(line, flush=True)
     return record

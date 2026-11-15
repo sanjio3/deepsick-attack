@@ -10,10 +10,13 @@ import unittest
 import urllib.error
 from unittest.mock import patch
 
-from deepsick_attack.bench_client import (
+from deepsick_attack.bench_client import (  # noqa: E402
+    MAX_WORKERS,
+    _workers,
     BenchConfigError,
     Challenge,
     ChallengesClient,
+    ResourceUnavailable,
     CloseResult,
     DuplicateSubmit,
     StartResult,
@@ -217,6 +220,70 @@ class FlowTest(unittest.TestCase):
         starts = [c for c in client.calls if isinstance(c, tuple) and c[0] == "start"]
         self.assertEqual([s[1] for s in starts], ["a", "b"])
         self.assertEqual(summary["started"], 2)
+
+
+class ConcurrencyTest(unittest.TestCase):
+    """平台允许同时 3 个实例，串行跑根本吃不满窗口。"""
+
+    def setUp(self):
+        os.environ["BENCH_IDLE_SECONDS"] = "0"
+        os.environ["BENCH_RETRY_DELAY"] = "0"
+
+    def tearDown(self):
+        os.environ.pop("BENCH_IDLE_SECONDS", None)
+        os.environ.pop("BENCH_RETRY_DELAY", None)
+
+    def test_concurrency_capped_at_three(self):
+        import threading as th
+
+        class Gauge:
+            def __init__(self):
+                self.lock = th.Lock()
+                self.active = 0
+                self.peak = 0
+
+            def enter(self):
+                with self.lock:
+                    self.active += 1
+                    self.peak = max(self.peak, self.active)
+
+            def leave(self):
+                with self.lock:
+                    self.active -= 1
+
+        gauge = Gauge()
+
+        class SlowClient(FakeClient):
+            def list_challenges(self):
+                self.calls.append("list")
+                return [Challenge(f"c{i}", "", "easy", 1, 100, 1, 0, False,
+                                  "running", []) for i in range(6)]
+
+            def start_challenge(self, code):
+                gauge.enter()
+                self.calls.append(("start", code))
+                return StartResult(code, ["10.0.0.2:80"])
+
+            def close_challenge(self, code):
+                gauge.leave()
+                self.calls.append(("close", code))
+                return CloseResult(code, True)
+
+        def slow_solver(ch, started):
+            time.sleep(0.12)
+            return []
+
+        summary = run_benchmark(slow_solver, client=SlowClient(), workers=3)
+        self.assertEqual(summary["started"], 6)
+        self.assertEqual(summary["closed"], 6)
+        self.assertLessEqual(gauge.peak, 3, f"并发超过 3：{gauge.peak}")
+
+    def test_workers_env_is_clamped(self):
+        os.environ["BENCH_WORKERS"] = "99"
+        try:
+            self.assertEqual(_workers(), MAX_WORKERS)
+        finally:
+            os.environ.pop("BENCH_WORKERS", None)
 
 
 if __name__ == "__main__":

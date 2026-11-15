@@ -121,6 +121,11 @@ class SolveContext:
     attempts: list[str] = field(default_factory=list)
     cmd_seen: dict[str, int] = field(default_factory=dict)
     cmd_cache: dict[str, str] = field(default_factory=dict)
+    # 命令一字不改才拦得住的情况有限：模型会把同一段 python 重写成不同写法去抓
+    # 同一个 URL（实跑里 app.js 被读了 8 遍）。所以再按「命令里出现的 URL 集合」
+    # 记一层，同一组 URL 抓第三次就拦。
+    url_seen: dict[str, int] = field(default_factory=dict)
+    url_cache: dict[str, str] = field(default_factory=dict)
 
 
 def parse_targets(container_addr: list[str]) -> tuple[str, list[int]]:
@@ -150,6 +155,42 @@ def parse_targets(container_addr: list[str]) -> tuple[str, list[int]]:
     return host, ports
 
 
+STUCK_HINTS = (
+    (("上传", "文件", "附件", "图片"), (
+        "上传类：改 Content-Type 与扩展名（.php/.phtml/.php5/.pht）、双扩展名（a.php.jpg）、"
+        "文件名注入（a.php%00.jpg）、.htaccess 覆盖解析、把 webshell 塞进图片头（GIF89a）、"
+        "找上传目录是否可直接访问 /uploads /upload /files。")),
+    (("内网", "探测", "URL", "诊断", "代理", "转发"), (
+        "SSRF/穿透类：参数改成 http://127.0.0.1:端口、http://内网服务名:端口、"
+        "http://169.254.169.254/latest/meta-data/、file:///flag 或 file:///etc/passwd、"
+        "dict://、gopher://；响应为空时试 302 跳转、试 /admin、试不同端口。")),
+    (("代码", "审计", "仓库", "源码"), (
+        "源码审计类：翻 .git/HEAD、.git/config、/backup/、*.zip/*.bak、sourceMappingURL、"
+        "/assets/js/*.js 里的接口与硬编码密钥；拿到源码后按路由逐个看鉴权。")),
+    (("报销", "合同", "资产", "办公", "工单", "审批", "报表", "后台"), (
+        "越权类：改 id 越权读别人的单子（id±1、UUID 遍历）、直接调导出/详情 API 绕过前端、"
+        "用普通账号打管理员接口、注意 ?debug=1 / ?admin=1 / X-Forwarded-For: 127.0.0.1。")),
+    (("序列化", "组件", "沙箱", "脚本"), (
+        "组件/沙箱类：确认组件版本与已知 gadget，试 yaml/jackson/fastjson/xstream 特征 payload、"
+        "试模板注入 {{7*7}}、试命令拼接与路径穿越。")),
+)
+
+
+def _stuck_hint(challenge: Challenge, step: int) -> str:
+    """连续多步没有新事实时，给一版对口的攻击面清单。
+
+    实跑里 a-03..a-16 全部跑满 60 步没有产出，轨迹显示它们反复读同一个 JS、
+    重复同一个 403 请求。模型不是不努力，是缺「换一族动作」的提示。
+    """
+    desc = f"{challenge.description} {challenge.unique_code}"
+    for keys, hint in STUCK_HINTS:
+        if any(k in desc for k in keys):
+            return f"已经第 {step} 步，仍然没有新事实。换攻击面，按这一族逐条试：\n{hint}"
+    return ("已经第 %d 步，仍然没有新事实。换攻击面：把入口当成别的漏洞类型再试一遍——"
+            "目录与备份文件、参数注入、越权 id、上传/写入、模板或反序列化、"
+            "内部服务与云元数据。" % step)
+
+
 def _cmd_signature(tool: str, args: dict) -> str:
     """把动作归一化成可比较的签名，用来识别「同一条命令又跑一遍」。"""
     if tool in ("shell", "session_start"):
@@ -157,6 +198,15 @@ def _cmd_signature(tool: str, args: dict) -> str:
     else:
         raw = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
     return f"{tool}:" + re.sub(r"\s+", " ", raw).strip()
+
+
+URL_RE = re.compile(r"https?://[^\s'\"<>|)]+", re.I)
+
+
+def _url_signature(command: str) -> str:
+    """命令里出现的 URL 集合。空集合表示这条命令不是在抓某个固定地址。"""
+    urls = sorted({m.group(0).rstrip(".,;") for m in URL_RE.finditer(command or "")})
+    return "|".join(urls)
 
 
 def _kill_tree(proc: "subprocess.Popen[str] | None") -> None:
@@ -456,8 +506,12 @@ class Toolkit:
         started = time.time()
         proc = None
         try:
+            # 必须用 `bash -c`，不能用 `bash -lc`：login shell 会读 /etc/profile，
+            # 而 Debian 的 profile 把 PATH 重新赋成默认值，/app/vendor/bin 被丢掉。
+            # 平台实跑轨迹里因此出现过 `curl: command not found`——整套静态工具
+            # 整轮都没生效。
             proc = subprocess.Popen(
-                ["bash", "-lc", command], stdout=subprocess.PIPE,
+                ["bash", "-c", command], stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, cwd="/tmp", text=True, errors="replace",
                 env=self.tool_env(), start_new_session=(os.name == "posix"),
             )
@@ -495,7 +549,7 @@ class Toolkit:
         # 命令不能加 exec，否则 exec 把 shell 替换掉，后面的命令永远不会执行。
         wrapped = (command if re.search(r"[;&|<>`$]", command)
                    else f"exec {command}")
-        argv = ["bash", "-lc", wrapped]
+        argv = ["bash", "-c", wrapped]
         try:
             session = self.sessions.start(argv, use_pty=use_pty and pty_available(),
                                           env=self.tool_env())
@@ -804,7 +858,11 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
              note="平台未返回可用靶标地址")
         return []
 
-    board = FactBoard(host=host)
+    # 并发跑多题时同一台宿主机 IP 上可能同时挂着几道题，事实板按题隔离，
+    # 否则两个线程会写同一个 facts-*.jsonl。
+    board = FactBoard(
+        path=os.path.join("/tmp", f"facts-{challenge.unique_code}-"
+                                  f"{int(time.time() * 1000)}.jsonl"), host=host)
     context = SolveContext(host=host, hint_ports=hint_ports, board=board)
     toolkit = Toolkit(context, shell_timeout=shell_timeout)
     steps = max_steps or int(os.environ.get("BENCH_MAX_STEPS", "60"))
@@ -858,6 +916,8 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
     last_tool = ""
     repeat = 0
     tripwires = 0
+    facts_seen = board.stats()["facts"]
+    stale = 0
     for step in range(1, steps + 1):
         if time.time() >= deadline:
             emit("solve_timeout", unique_code=challenge.unique_code, step=step)
@@ -872,12 +932,20 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
         context.sessions_text = toolkit.session_list()
         prompt = _build_pick_prompt(challenge, context)
         started_at = time.time()
-        try:
-            reply = client.complete(SYSTEM_PROMPT,
-                                    messages=[{"role": "user", "content": prompt}])
-        except Exception as exc:  # noqa: BLE001
-            emit("solve_llm_error", unique_code=challenge.unique_code, step=step,
-                 detail=f"{type(exc).__name__}: {exc}"[:200])
+        # 模型调用失败不能直接放弃这道题：并发跑多题时最容易撞到 429/超时，
+        # 一次瞬时错误就把整题扔掉等于白跑。重试 3 次再认输。
+        reply = None
+        for attempt in range(3):
+            try:
+                reply = client.complete(
+                    SYSTEM_PROMPT, messages=[{"role": "user", "content": prompt}])
+                break
+            except Exception as exc:  # noqa: BLE001
+                emit("solve_llm_error", unique_code=challenge.unique_code, step=step,
+                     attempt=attempt + 1, detail=f"{type(exc).__name__}: {exc}"[:200])
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+        if reply is None:
             break
         text = reply.get("text") or ""
         action = _extract_json_object(text)
@@ -954,22 +1022,33 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
         call_args = args if isinstance(args, dict) else {}
         signature = _cmd_signature(tool, call_args)
         repeats = context.cmd_seen.get(signature, 0)
-        # 同一条命令跑第三遍时直接拦掉并回放上次输出：靶标不会因为重复请求变好，
-        # 只会把 40 步预算烧在同一个 404 上（本地实测第 6-8 步在原地打转）。
+        raw_command = str(call_args.get("command") or call_args.get("cmd") or "")
+        url_sig = _url_signature(raw_command) if tool in ("shell", "session_start") else ""
+        url_hits = context.url_seen.get(url_sig, 0) if url_sig else 0
+        # 两道去重：同一条命令第三遍拦；同一组 URL 抓第三遍也拦。
+        # 靶标不会因为重复请求变好，只会把步数预算烧在同一个 404 上。
+        blocked = None
         if tool in ("shell", "session_start") and repeats >= 2:
-            cached = context.cmd_cache.get(signature, "")
-            output = (f"（拦下）这条命令已经跑过 {repeats} 次，结果不会变。"
-                      f"换端口、换路径、换协议，或者从下面这次输出继续推。\n"
+            blocked = ("这条命令", context.cmd_cache.get(signature, ""), repeats)
+        elif url_sig and url_hits >= 2:
+            blocked = ("这组 URL", context.url_cache.get(url_sig, ""), url_hits)
+        if blocked:
+            what, cached, hits = blocked
+            output = (f"（拦下）{what}已经抓过 {hits} 次，结果不会变。"
+                      f"换路径/换参数/换攻击点，或者从下面这次输出继续推。\n"
                       f"上次输出：\n{cached[:600] or '(无)'}")
             elapsed = time.time() - started_at
             emit("solve_repeat_blocked", unique_code=challenge.unique_code,
-                 step=step, tool=tool, repeats=repeats)
+                 step=step, tool=tool, repeats=hits, kind=what)
         else:
             output = toolkit.run(tool, call_args)
             elapsed = time.time() - started_at
             if tool in ("shell", "session_start"):
                 context.cmd_seen[signature] = repeats + 1
                 context.cmd_cache[signature] = output
+                if url_sig:
+                    context.url_seen[url_sig] = url_hits + 1
+                    context.url_cache[url_sig] = output
                 summary = output.replace("\n", " ")[:110]
                 context.attempts.append(
                     f"- 第{step}步 {tool} `{signature.split(':', 1)[1][:90]}` → {summary}")
@@ -1006,6 +1085,19 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
                 step, "(重复了)", {},
                 "你连续三次跑同一个动作，不会有新信息。换端口、换协议、换路径，"
                 "或者换一种利用方式。", time.time() - started_at))
+
+        now_facts = board.stats()["facts"]
+        if now_facts > facts_seen:
+            facts_seen = now_facts
+            stale = 0
+        else:
+            stale += 1
+        if stale and stale % 15 == 0:
+            emit("solve_stuck_hint", unique_code=challenge.unique_code,
+                 step=step, stale=stale)
+            context.observations.append(Observation(
+                step, "(卡住了)", {}, _stuck_hint(challenge, step),
+                time.time() - started_at))
 
     toolkit.sessions.close_all()
     emit("solve_done", unique_code=challenge.unique_code,
