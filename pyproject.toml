@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "智能体安全攻防挑战赛攻击赛道参赛 Agent：按主办方标准路径逐阶段取证并夺取 Flag"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "sanjio3", email = "2433877589@qq.com" }]
+authors = [{ name = "sanjio3" }]
 dependencies = []
 
 [project.scripts]

@@ -1,3 +1,2 @@
-# 第二位协作者的 GitHub 账号确认后补到下面这一行。
-# 当前先由仓库所有者兜底，保证每个 PR 都能被指派到 reviewer。
-* @sanjio3
+# 双人合作：所有改动指派两位成员，PR 由另一位成员 review。
+* @sanjio3 @fressive
