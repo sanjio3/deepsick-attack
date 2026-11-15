@@ -5,6 +5,11 @@
 2. 边由入口属性派生，不是穷举 payload 表；
 3. 拿到能力后 flag_hunt 会被派生出来并且排在最前（不再回头挖洞）。
 """
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
 import unittest
 
 from deepsick_attack import graph_exec

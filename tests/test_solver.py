@@ -1,3 +1,9 @@
+"""solver / agent_loop 回归测试。
+
+新架构下 solve_challenge = 代码侦察打底 + AgentRunner（原生 tool_use 循环）。
+所以循环行为测试全部改成脚本化假 client（FakeClient 直接返回 tool_use 块），
+不再喂 JSON 文本。
+"""
 import sys
 from pathlib import Path
 
@@ -115,19 +121,33 @@ class _BannerServer:
         return False
 
 
-class FakeLLM:
-    def __init__(self, replies):
-        self.replies = list(replies)
-        self.calls = 0
-        self.prompts = []
+class FakeClient:
+    """新协议的假 client：脚本化返回 tool_use 块。
 
-    def complete(self, system, messages=None, **kwargs):
+    script 的每个元素是一轮里的若干 (tool_name, input) 调用，按顺序消费；
+    脚本耗尽后返回纯文本（触发 idle 提醒）。
+    """
+
+    def __init__(self, script):
+        self.script = [list(turn) for turn in script]
+        self.calls = 0
+        self.system_prompts = []
+        self.hist = []
+
+    def chat(self, system, messages, tools=None, **kwargs):
         self.calls += 1
-        if messages:
-            self.prompts.append(messages[-1]["content"])
-        if not self.replies:
-            return {"text": json.dumps({"thought": "done", "flags": []})}
-        return {"text": self.replies.pop(0)}
+        self.system_prompts.append(system)
+        self.hist.append(json.loads(json.dumps(messages)))
+        if not self.script:
+            return {"content": [{"type": "text", "text": "脚本已耗尽"}],
+                    "stop_reason": "end_turn"}
+        batch = self.script.pop(0)
+        blocks = []
+        for i, (name, inp) in enumerate(batch):
+            blocks.append({"type": "text", "text": f"调用 {name} #{i}"})
+            blocks.append({"type": "tool_use", "id": f"c{self.calls}-{i}",
+                           "name": name, "input": inp})
+        return {"content": blocks, "stop_reason": "tool_use"}
 
 
 def make_challenge(**over):
@@ -145,6 +165,11 @@ def make_challenge(**over):
 def _ctx(port, base_url=""):
     return SolveContext(host="127.0.0.1", hint_ports=[port],
                         base_url=base_url or f"http://127.0.0.1:{port}")
+
+
+def _board(host="h"):
+    """每个用例独立的事实板目录，避免上一轮残留影响判定。"""
+    return FactBoard(host=host, path=tempfile.mktemp(suffix=".jsonl"))
 
 
 class ParseTargetsTest(unittest.TestCase):
@@ -197,11 +222,6 @@ class SenseTest(unittest.TestCase):
 
     def test_expand_ports_without_hints_scans_top(self):
         self.assertIn(22, sense.expand_ports([]))
-
-
-def _board(host="h"):
-    """每个用例独立的事实板目录，避免上一轮残留影响判定。"""
-    return FactBoard(host=host, path=tempfile.mktemp(suffix=".jsonl"))
 
 
 class FactBoardTest(unittest.TestCase):
@@ -410,139 +430,6 @@ class SshOnlyChallengeTest(unittest.TestCase):
         self.assertFalse(any(i.startswith("http:") for i in ids))
 
 
-class SolveChallengeTest(unittest.TestCase):
-    def setUp(self):
-        self.events = []
-        set_sink(self.events.append)
-
-    def tearDown(self):
-        set_sink(None)
-
-    def _events(self, name):
-        return [e for e in self.events if e["event"] == name]
-
-    def test_recon_then_model_finds_flag(self):
-        with _Server() as srv:
-            llm = FakeLLM([json.dumps({"thought": "看隐藏文件", "tool": "http_get",
-                                       "args": {"path": "/secret"}})])
-            flags = solve_challenge(
-                make_challenge(), StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
-                llm, deadline=time.time() + 30, max_steps=4)
-        self.assertEqual(flags, [FLAG])
-        self.assertTrue(self._events("solve_flag_found"))
-        self.assertTrue(self._events("recon_scan"))
-
-    def test_pick_candidate_is_executed(self):
-        with _Server() as srv:
-            llm = FakeLLM([
-                json.dumps({"pick": "http:%d:home" % srv.port, "thought": "先看首页"}),
-                json.dumps({"pick": "http:%d:missing" % srv.port, "thought": "测蜜罐"}),
-            ])
-            solve_challenge(
-                make_challenge(), StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
-                llm, deadline=time.time() + 30, max_steps=3)
-            first = llm.prompts[0]
-        self.assertIn("候选动作", first)
-        self.assertIn("事实板", first)
-        self.assertIn("http:%d:home" % srv.port, first)
-
-    def test_live_submit_gets_platform_feedback(self):
-        with _Server() as srv:
-            llm = FakeLLM([json.dumps({"tool": "http_get",
-                                       "args": {"path": "/secret"}})])
-            calls = []
-
-            class Result:
-                correct = True
-                awarded = 200
-                correct_flag_count = 1
-                total_flag_count = 1
-
-            flags = solve_challenge(
-                make_challenge(), StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
-                llm, deadline=time.time() + 30, max_steps=4,
-                submit=lambda flag: (calls.append(flag), Result())[1])
-        self.assertEqual(calls, [FLAG])
-        self.assertEqual(flags, [FLAG])
-        self.assertTrue(self._events("solve_submit"))
-
-    def test_claimed_flag_without_evidence_still_submitted(self):
-        """模型编的 flag 也交给平台判——0 次提交拿不到任何反馈。"""
-        with _Server() as srv:
-            llm = FakeLLM([json.dumps({"thought": "编一个",
-                                       "flags": ["flag{no_such_flag}"]})])
-            flags = solve_challenge(
-                make_challenge(), StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
-                llm, deadline=time.time() + 30, max_steps=2)
-        self.assertIn("flag{no_such_flag}", flags)
-
-    def test_empty_flags_does_not_end_challenge(self):
-        with _Server() as srv:
-            llm = FakeLLM([json.dumps({"thought": "没思路", "flags": []}),
-                           json.dumps({"tool": "http_get",
-                                       "args": {"path": "/secret"}})])
-            flags = solve_challenge(
-                make_challenge(), StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
-                llm, deadline=time.time() + 30, max_steps=4)
-        self.assertEqual(flags, [FLAG])
-        self.assertGreaterEqual(llm.calls, 2)
-
-    def test_tripwire_marks_service_risky(self):
-        with _Server() as srv:
-            llm = FakeLLM([json.dumps({"tool": "http_get",
-                                       "args": {"path": "/trap"}})])
-            solve_challenge(
-                make_challenge(), StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
-                llm, deadline=time.time() + 30, max_steps=2)
-        self.assertTrue(self._events("solve_tripwire"))
-
-    def test_invalid_action_does_not_abort(self):
-        with _Server() as srv:
-            llm = FakeLLM([
-                "我不太确定要做什么",
-                json.dumps({"tool": "http_get", "args": {"path": "/secret"}}),
-            ])
-            flags = solve_challenge(
-                make_challenge(), StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
-                llm, deadline=time.time() + 30, max_steps=4)
-        self.assertEqual(flags, [FLAG])
-        self.assertTrue(self._events("solve_bad_action"))
-
-    def test_bad_pick_does_not_abort(self):
-        with _Server() as srv:
-            llm = FakeLLM([
-                json.dumps({"pick": "http:9:nowhere"}),
-                json.dumps({"tool": "http_get", "args": {"path": "/secret"}}),
-            ])
-            flags = solve_challenge(
-                make_challenge(), StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
-                llm, deadline=time.time() + 30, max_steps=4)
-        self.assertEqual(flags, [FLAG])
-        self.assertTrue(self._events("solve_bad_pick"))
-
-    def test_no_target_returns_empty(self):
-        flags = solve_challenge(make_challenge(), StartResult("t-001", []), FakeLLM([]))
-        self.assertEqual(flags, [])
-        self.assertTrue(self._events("solve_no_target"))
-
-    def test_deadline_stops_immediately(self):
-        llm = FakeLLM([json.dumps({"tool": "http_get", "args": {}})])
-        flags = solve_challenge(
-            make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
-            llm, deadline=time.time() - 1)
-        self.assertEqual(flags, [])
-        self.assertEqual(llm.calls, 0)
-
-    def test_flag_submission_capped(self):
-        with _Server() as srv:
-            llm = FakeLLM([json.dumps({"tool": "http_get",
-                                       "args": {"path": "/many"}})])
-            flags = solve_challenge(
-                make_challenge(), StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
-                llm, deadline=time.time() + 30, max_steps=2)
-        self.assertEqual(len(flags), 15)
-
-
 class SessionTest(unittest.TestCase):
     """会话是这一版的核心能力：没有它做不了反弹 shell / 交互式 ssh / nc。"""
 
@@ -579,229 +466,8 @@ class SessionTest(unittest.TestCase):
         self.assertIn("没有 id=99", toolkit.run("session_read", {"id": 99}))
 
 
-class CmdActionTest(unittest.TestCase):
-    """模型直接写 cmd 跑命令——这是 CAI 式的用法，必须通。"""
-
-    def setUp(self):
-        self.events = []
-        set_sink(self.events.append)
-        self.tmp = tempfile.mktemp()
-        Path(self.tmp).write_text(FLAG, encoding="utf-8")
-
-    def tearDown(self):
-        set_sink(None)
-
-    def test_cmd_runs_shell_and_extracts_flag(self):
-        llm = FakeLLM([json.dumps({"cmd": f"cat {Path(self.tmp).as_posix()}",
-                                   "why": "读文件"})])
-        flags = solve_challenge(
-            make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
-            llm, deadline=time.time() + 30, max_steps=3)
-        self.assertIn(FLAG, flags)
-
-
-class RepeatBlockTest(unittest.TestCase):
-    """同一条命令第三遍必须被拦下。
-
-    本地冒烟实测：第 2 步读 robots.txt，第 6 步又读了一遍，第 7、8 步重复枚举
-    同一个目录。40 步预算经不起这种原地打转。
-    """
-
-    def setUp(self):
-        self.events = []
-        set_sink(self.events.append)
-        self.counter = tempfile.mktemp()
-
-    def tearDown(self):
-        set_sink(None)
-
-    def test_third_identical_command_is_blocked(self):
-        cmd = f"echo hit >> {Path(self.counter).as_posix()}"
-        llm = FakeLLM([json.dumps({"cmd": cmd}) for _ in range(6)])
-        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
-                        llm, deadline=time.time() + 40, max_steps=6)
-        lines = [ln for ln in Path(self.counter).read_text(encoding="utf-8").splitlines()]
-        self.assertEqual(len(lines), 2, f"重复命令被执行了 {len(lines)} 次")
-        self.assertTrue(any(e["event"] == "solve_repeat_blocked" for e in self.events))
-
-    def test_attempts_are_shown_in_prompt(self):
-        cmd = "echo probe"
-        llm = FakeLLM([json.dumps({"cmd": cmd}),
-                       json.dumps({"cmd": "echo probe2"})])
-        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
-                        llm, deadline=time.time() + 40, max_steps=2)
-        self.assertTrue(any("已经跑过的动作" in p for p in llm.prompts),
-                        "第二轮提示词里必须能看到已跑过的命令")
-
-
-class UrlDedupeTest(unittest.TestCase):
-    """同一个 URL 抓第三次要拦。
-
-    平台实跑轨迹里 app.js 被读了 8 遍（第 46/47/49/51/52/53 步），每次换一种
-    python 写法，逐字去重拦不住。
-    """
-
-    def setUp(self):
-        self.events = []
-        set_sink(self.events.append)
-        self.counter = tempfile.mktemp()
-
-    def tearDown(self):
-        set_sink(None)
-
-    def test_third_fetch_of_same_url_is_blocked(self):
-        target = "http://127.0.0.1:1/assets/app.js"
-        cmds = [f"echo fetch1 >> {Path(self.counter).as_posix()}; curl -s -m 2 {target} >/dev/null",
-                f"echo fetch2 >> {Path(self.counter).as_posix()}; python3 -c \"import urllib.request;urllib.request.urlopen('{target}',timeout=2)\"",
-                f"echo fetch3 >> {Path(self.counter).as_posix()}; wget -q -O- {target} || true"]
-        llm = FakeLLM([json.dumps({"cmd": c}) for c in cmds])
-        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
-                        llm, deadline=time.time() + 60, max_steps=3)
-        lines = Path(self.counter).read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(lines), 2, f"第三次抓同一 URL 仍被执行：{len(lines)} 次")
-        self.assertTrue(any(e["event"] == "solve_repeat_blocked"
-                            and e.get("kind") == "这组 URL" for e in self.events))
-
-
-class UrlDedupeScopeTest(unittest.TestCase):
-    """同一 URL 换过滤条件再读，不算重复。
-
-    实跑 a-04 时模型反复读同一个 app.js，但每次 grep 的关键字不同（upload /
-    api_key / sed 区间），旧实现把它们全拦了——25 步里 10 步白扔，而且把真实
-    入口 /api/upload.php 记成「已排除」，直接把模型从正解上推开。
-    """
-
-    def setUp(self):
-        self.events = []
-        set_sink(self.events.append)
-
-    def tearDown(self):
-        set_sink(None)
-
-    def test_filtered_reads_of_same_url_are_allowed(self):
-        target = "http://127.0.0.1:1/assets/app.js"
-        cmds = [f"curl -sS -m 2 {target} | grep -i upload",
-                f"curl -sS -m 2 {target} | grep -i api_key",
-                f"curl -sS -m 2 {target} | sed -n '60,110p'"]
-        llm = FakeLLM([json.dumps({"cmd": c}) for c in cmds])
-        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
-                        llm, deadline=time.time() + 60, max_steps=3)
-        self.assertFalse([e for e in self.events
-                          if e["event"] == "solve_repeat_blocked"],
-                         "带过滤的再读被误拦了")
-
-    def test_pure_fetch_still_deduped(self):
-        """什么都不做的重复抓取还是要拦——那是真的没新信息。"""
-        target = "http://127.0.0.1:1/assets/app.js"
-        cmds = [f"curl -sS -m 2 {target}"] * 3
-        llm = FakeLLM([json.dumps({"cmd": c}) for c in cmds])
-        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
-                        llm, deadline=time.time() + 60, max_steps=3)
-        self.assertTrue([e for e in self.events
-                         if e["event"] == "solve_repeat_blocked"])
-
-
-class CandidatePriorityTest(unittest.TestCase):
-    """候选只取前 8 条，本题入口必须排在邻居端口前面。"""
-
-    def test_entry_port_candidates_come_first(self):
-        board = _board("10.0.0.1")
-        for port in ("18300", "18301", "18302", "18308"):
-            board.add(Fact("service", f"10.0.0.1:{port}",
-                           f"10.0.0.1:{port} http"))
-        board.add(Fact("entry", "entry:10.0.0.1:18308", "本题入口", "high"))
-        ids = [c.id for c in propose(board)]
-        self.assertTrue(any("18308" in item for item in ids), ids)
-
-
-class RcePivotTest(unittest.TestCase):
-    """拿到命令执行后必须马上转去找 flag。
-
-    实跑 a-04：第 10 步已经 `uid=33(www-data)`，之后 8 步还在重新上传 shell、
-    测 404 的文件名，而 /challenge/flag.txt 就摆在那里。
-    """
-
-    def setUp(self):
-        self.events = []
-        set_sink(self.events.append)
-
-    def tearDown(self):
-        set_sink(None)
-
-    def test_exec_proof_triggers_flag_hunt_hint(self):
-        llm = FakeLLM([
-            json.dumps({"cmd": "echo uid=33(www-data)"}),
-            json.dumps({"cmd": "echo next"}),
-        ])
-        ctx_prompts = []
-        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
-                        llm, deadline=time.time() + 30, max_steps=2)
-        ctx_prompts = llm.prompts
-        self.assertTrue(any(e["event"] == "solve_rce" for e in self.events))
-        self.assertTrue(any("/challenge/flag.txt" in p for p in ctx_prompts),
-                        "拿到执行后没有把 flag 常见位置推给模型")
-
-    def test_hint_appears_only_once(self):
-        llm = FakeLLM([json.dumps({"cmd": "id; echo uid=33(www-data)"}) for _ in range(4)])
-        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
-                        llm, deadline=time.time() + 30, max_steps=4)
-        self.assertEqual(len([e for e in self.events if e["event"] == "solve_rce"]), 1)
-
-
-class UploadMemoryTest(unittest.TestCase):
-    """上传成功要记成事实，模型自己会忘掉哪个文件名是活的。"""
-
-    def setUp(self):
-        self.events = []
-        set_sink(self.events.append)
-
-    def tearDown(self):
-        set_sink(None)
-
-    def test_uploaded_path_is_recorded(self):
-        resp = json.dumps({"cmd": "echo '{\"success\":true,\"path\":\"uploads/x.php7\"}'"})
-        llm = FakeLLM([resp])
-        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
-                        llm, deadline=time.time() + 30, max_steps=1)
-        recorded = [e for e in self.events if e["event"] == "solve_upload_recorded"]
-        self.assertTrue(recorded)
-        self.assertIn("uploads/x.php7", recorded[0]["url"])
-
-    def test_curl_26_gets_a_corrective_hint(self):
-        cmd = ("echo '(26) Failed to open/read local data from file/application'")
-        llm = FakeLLM([json.dumps({"cmd": cmd}),
-                       json.dumps({"cmd": "echo next"})])
-        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
-                        llm, deadline=time.time() + 30, max_steps=2)
-        self.assertTrue(any("printf" in p and "ls -l /tmp" in p for p in llm.prompts),
-                        "curl(26) 之后没有给出正确写法")
-
-
-class BreakerTest(unittest.TestCase):
-    def setUp(self):
-        self.events = []
-        set_sink(self.events.append)
-
-    def tearDown(self):
-        set_sink(None)
-
-    def test_tripwire_breaker_stops_challenge(self):
-        with _Server() as srv:
-            llm = FakeLLM([json.dumps({"tool": "http_get",
-                                       "args": {"path": "/trap"}})
-                           for _ in range(5)])
-            solve_challenge(
-                make_challenge(), StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
-                llm, deadline=time.time() + 40, max_steps=6)
-        self.assertTrue(any(e["event"] == "solve_breaker" for e in self.events))
-
-
 class ShellTimeoutTest(unittest.TestCase):
-    """超时必须真的把命令杀掉，不能只杀直接子进程。
-
-    实跑教训：`bash -lc "nmap ..."` 的孙进程会一直占着管道，subprocess.run 的
-    timeout 之后 communicate 还在等，本地实测设 30s 实际卡了 120s。
-    """
+    """超时必须真的把命令杀掉，不能只杀直接子进程。"""
 
     def test_timeout_returns_quickly_and_reports(self):
         ctx = SolveContext(host="127.0.0.1", hint_ports=[])
@@ -862,11 +528,7 @@ class AcceptsSubmitTest(unittest.TestCase):
 
 
 class BulkProbeTest(unittest.TestCase):
-    """敏感路径探测从「模型一步步试」改成「代码一次打完」。
-
-    实跑轨迹里模型为 /backup/、/robots.txt、/.git/HEAD 这类路径花了二三十步，
-    每步一个 curl。这些判定完全确定，不该占模型步数。
-    """
+    """敏感路径探测从「模型一步步试」改成「代码一次打完」。"""
 
     def test_reports_only_paths_that_exist(self):
         with _Server() as srv:
@@ -900,8 +562,6 @@ class BulkProbeTest(unittest.TestCase):
 
 
 class AttackFamilyTest(unittest.TestCase):
-    """失败要记成「某族 @ 某路径」，让下一轮提示词能点名，模型才会换族。"""
-
     def test_upload_family_and_path(self):
         self.assertEqual(
             _attack_family("curl -F 'f=@a.png;filename=a.php' http://h:80/upload.php"),
@@ -927,21 +587,9 @@ class AttackFamilyTest(unittest.TestCase):
         self.assertEqual(family, "上传绕过")
         self.assertEqual(path, "", "变量路径不能当真实路径记账")
 
-    def test_failed_family_is_named_in_next_prompt(self):
-        with _Server() as srv:
-            llm = FakeLLM([
-                json.dumps({"cmd": f"curl -sS -i -m 5 'http://127.0.0.1:{srv.port}/trap?id=2'"}),
-                json.dumps({"cmd": "echo second"}),
-            ])
-            solve_challenge(make_challenge(),
-                            StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
-                            llm, deadline=time.time() + 30, max_steps=2)
-        self.assertTrue(any("已排除" in p and "越权 id" in p for p in llm.prompts),
-                        f"提示词里没有点名已排除的攻击族：{llm.prompts[-1][:600]}")
 
-
-class BadActionRetryTest(unittest.TestCase):
-    """输出不是 JSON 不该算掉一步：重问一次，第二次才认输。"""
+class SolveChallengeTest(unittest.TestCase):
+    """新协议端到端：FakeClient 直接发 tool_use，走完整循环。"""
 
     def setUp(self):
         self.events = []
@@ -950,24 +598,139 @@ class BadActionRetryTest(unittest.TestCase):
     def tearDown(self):
         set_sink(None)
 
-    def test_retry_recovers_without_spending_a_step(self):
-        llm = FakeLLM([
-            "我想先看看首页，然后再决定。",            # 第 1 步：不是 JSON
-            json.dumps({"cmd": "echo recovered"}),      # 重问：合法 JSON
+    def _events(self, name):
+        return [e for e in self.events if e["event"] == name]
+
+    def test_no_target_returns_empty(self):
+        flags = solve_challenge(make_challenge(), StartResult("t-001", []),
+                                FakeClient([]))
+        self.assertEqual(flags, [])
+        self.assertTrue(self._events("solve_no_target"))
+
+    def test_deadline_stops_immediately(self):
+        client = FakeClient([])
+        flags = solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
+                                client, deadline=time.time() - 1)
+        self.assertEqual(flags, [])
+        self.assertEqual(client.calls, 0)
+
+    def test_shell_output_flag_auto_submitted(self):
+        """shell 工具的输出里有 flag 就自动交——确定性副驾驶不占模型回合。"""
+        with _Server() as srv:
+            client = FakeClient([
+                [("shell", {"command": f"curl -s -m 6 http://127.0.0.1:{srv.port}/secret"})],
+                [("finish", {"summary": "flag 已交"})],
+            ])
+            flags = solve_challenge(
+                make_challenge(), StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
+                client, deadline=time.time() + 60, max_steps=6)
+        self.assertEqual(flags, [FLAG])
+        self.assertTrue(self._events("recon_scan"))
+        # flag 数够了走 agent_all_flags 提前收尾，否则等 finish 工具
+        self.assertTrue(self._events("agent_finish") or self._events("agent_all_flags"))
+
+    def test_submit_tool_gets_platform_feedback(self):
+        with _Server() as srv:
+            calls = []
+
+            class Result:
+                correct = True
+                correct_flag_count = 1
+                total_flag_count = 1
+
+            client = FakeClient([
+                [("submit_flag", {"flags": [FLAG]})],
+                [("finish", {"summary": "done"})],
+            ])
+            flags = solve_challenge(
+                make_challenge(), StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
+                client, deadline=time.time() + 60, max_steps=4,
+                submit=lambda f: (calls.append(f), Result())[1])
+        self.assertEqual(calls, [FLAG])
+        self.assertEqual(flags, [FLAG])
+        self.assertTrue(self._events("solve_submit"))
+
+    def test_claimed_flag_without_evidence_still_submitted(self):
+        """模型编的 flag 也交给平台判——0 次提交拿不到任何反馈。"""
+        client = FakeClient([
+            [("submit_flag", {"flags": ["flag{no_such_flag}"]})],
+            [("finish", {"summary": "试过了"})],
+        ])
+        flags = solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
+                                client, deadline=time.time() + 30, max_steps=3)
+        self.assertIn("flag{no_such_flag}", flags)
+
+    def test_finish_ends_loop(self):
+        client = FakeClient([[("finish", {"summary": "没找到"})]])
+        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
+                        client, deadline=time.time() + 30, max_steps=5)
+        self.assertEqual(client.calls, 1)
+        self.assertTrue(self._events("agent_finish"))
+
+
+class LoopMechanicsTest(unittest.TestCase):
+    """agent 循环的机制测试：角色切换、工具容错、上下文 GC。"""
+
+    def setUp(self):
+        self.events = []
+        set_sink(self.events.append)
+
+    def tearDown(self):
+        set_sink(None)
+
+    def test_planner_nudge_after_close_intent(self):
+        """intent 收口后下一轮必须注入 planner 指令（artex 的角色切换点）。"""
+        client = FakeClient([
+            [("graph", {"op": "add_intent", "family": "lfi", "target": "x",
+                        "why": "探路"}),
+             ("graph", {"op": "close_intent", "intent_id": 1, "status": "dead",
+                        "verdict": "无差异"})],
+            [("finish", {"summary": "done"})],
         ])
         solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
-                        llm, deadline=time.time() + 30, max_steps=1)
-        self.assertEqual(llm.calls, 2)
-        self.assertTrue(any(e["event"] == "solve_bad_action" for e in self.events))
-        self.assertFalse(any(e["event"] == "solve_bad_action_giveup"
-                             for e in self.events))
+                        client, deadline=time.time() + 30, max_steps=4)
+        second_turn_messages = client.hist[1]
+        last = second_turn_messages[-1]
+        text = "".join(b.get("text", "") for b in last["content"]
+                       if isinstance(b, dict))
+        self.assertIn("planner 指令", text, "收口后没有切换到 planner 角色")
 
-    def test_gives_up_after_second_failure(self):
-        llm = FakeLLM(["不是 JSON", "还不是 JSON"])
+    def test_unknown_tool_does_not_kill_loop(self):
+        client = FakeClient([
+            [("bogus_tool", {"x": 1})],
+            [("finish", {"summary": "done"})],
+        ])
         solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
-                        llm, deadline=time.time() + 30, max_steps=1)
-        self.assertTrue(any(e["event"] == "solve_bad_action_giveup"
-                            for e in self.events))
+                        client, deadline=time.time() + 30, max_steps=4)
+        self.assertEqual(client.calls, 2, "未知工具应该报错字符串而不是打断循环")
+
+    def test_seed_message_carries_recon(self):
+        """开局消息必须把侦察结果和图状态带给模型（状态外置的读回路径）。"""
+        with _Server() as srv:
+            client = FakeClient([[("finish", {"summary": "done"})]])
+            solve_challenge(
+                make_challenge(), StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
+                client, deadline=time.time() + 60, max_steps=3)
+        seed = client.hist[0][0]["content"]
+        self.assertIn("侦察", seed)
+        self.assertTrue(client.system_prompts[0].startswith("你是授权 CTF 靶场"))
+
+    def test_gc_archives_old_outputs(self):
+        """老 tool_result 超长要归档；关键结论在 notes/图/证据里。"""
+        client = FakeClient([
+            [("shell", {"command": "python3 -c \"print('A'*5000)\""})],
+        ] + [[("shell", {"command": f"echo fill{i}"})] for i in range(9)]
+            + [[("finish", {"summary": "done"})]])
+        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
+                        client, deadline=time.time() + 120, max_steps=15)
+        # 第 2 次调用时的最后一条消息才是第 1 轮的 tool_result（第 1 次调用时
+        # 对话里只有种子消息）
+        first_results = client.hist[1][-1]["content"]
+        big = [b for b in first_results
+               if isinstance(b, dict) and b.get("type") == "tool_result"]
+        self.assertTrue(big)
+        self.assertTrue(any("已归档" in str(b.get("content", "")) for b in big),
+                         "超长输出没有被 GC 归档")
 
 
 if __name__ == "__main__":

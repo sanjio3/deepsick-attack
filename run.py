@@ -3,8 +3,8 @@
 
 本机若无法 `pip install -e .`（例如离线或缺构建依赖），用这个入口即可：
     python run.py validate
-    python run.py self-test
-    python run.py run --target 1
+    python run.py llm-check
+    python run.py bench-solve --only a-04 --log-file logs/run.jsonl
     python run.py pack --out dist/skill.zip
 """
 import sys

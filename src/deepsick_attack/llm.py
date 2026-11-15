@@ -77,18 +77,7 @@ class MiniMaxClient:
         self.config = config or get_config()
         self.timeout = timeout
 
-    def complete(self, system: str, user: str = "",
-                 max_tokens: int | None = None,
-                 effort: str | None = None,
-                 messages: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-        """单轮或多轮补全。给出 messages 时忽略 user，用于多步工具调用的上下文累积。"""
-        payload = {
-            "model": self.config["model"],
-            "max_tokens": max_tokens or self.config["max_tokens"],
-            "output_config": {"effort": effort or self.config["effort"]},
-            "system": system,
-            "messages": messages or [{"role": "user", "content": user}],
-        }
+    def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
             self.config["base_url"] + "/v1/messages",
@@ -101,13 +90,24 @@ class MiniMaxClient:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                raw = json.loads(response.read().decode("utf-8"))
+                return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
             raise LLMError(f"HTTP {exc.code}: {detail}") from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise LLMError(f"网络请求失败：{type(exc).__name__}") from exc
 
+    @staticmethod
+    def _base_payload(model_key: str = "model") -> dict[str, Any]:
+        return {"model": model_key}
+
+    def complete(self, system: str, user: str = "",
+                 max_tokens: int | None = None,
+                 effort: str | None = None,
+                 messages: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """单轮或多轮补全。给出 messages 时忽略 user，用于多步工具调用的上下文累积。"""
+        raw = self.chat(system, messages or [{"role": "user", "content": user}],
+                        max_tokens=max_tokens, effort=effort)
         texts = [
             block.get("text", "")
             for block in raw.get("content", [])
@@ -119,6 +119,28 @@ class MiniMaxClient:
             "usage": raw.get("usage", {}),
             "model": raw.get("model"),
         }
+
+    def chat(self, system: str, messages: list[dict[str, Any]],
+             tools: list[dict[str, Any]] | None = None,
+             max_tokens: int | None = None,
+             effort: str | None = None) -> dict[str, Any]:
+        """原生协议调用：返回完整响应（content 里可能有 text/tool_use 块）。
+
+        这是 agent 循环的底层接口。tools 是 Anthropic 工具 schema 列表；
+        tool_use 块由调用方执行后以 tool_result 塞回 messages 再调下一轮。
+        实测（tools_probe_tools_api.py）MiniMax 兼容端点支持完整工具协议，
+        并返回 cache_read_input_tokens（system 稳定时命中缓存）。
+        """
+        payload: dict[str, Any] = {
+            "model": self.config["model"],
+            "max_tokens": max_tokens or self.config["max_tokens"],
+            "output_config": {"effort": effort or self.config["effort"]},
+            "system": system,
+            "messages": messages,
+        }
+        if tools:
+            payload["tools"] = tools
+        return self._post(payload)
 
     def check(self) -> dict[str, Any]:
         """最小连通性验证：低思考深度、短回复，不打印凭据。"""

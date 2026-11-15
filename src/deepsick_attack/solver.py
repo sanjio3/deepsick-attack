@@ -34,12 +34,14 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from . import graph_exec, sense
+from .agent_loop import AgentRunner
 from .attack_graph import AttackGraph, Entry, extract_entries
 from .bench_client import Challenge, StartResult
 from .events import emit
+from .explore_graph import ExploreGraph
 from .facts import Fact, FactBoard
 from .flags import extract_flags  # noqa: F401  - 对外兼容旧的 import 路径
-from .playbook import Candidate, detect, propose
+from .workspace import Workspace
 from .session import SessionManager, pty_available
 
 MAX_OBS_CHARS = 2600
@@ -1145,11 +1147,11 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
                     shell_timeout: int = 30,
                     submit: Callable[[str], Any] | None = None,
                     bench_client: Any = None) -> list[str]:
-    """跑单道题。返回已提交（或已收集）的 Flag 列表。
+    """跑单道题：代码侦察打底，然后交给 artex 式 agent 循环。
 
-    submit 由调用方注入（把 flag 交给平台并返回结果），有它就能拿到平台反馈，
-    没有就只在本地收集，供离线测试使用。bench_client 是平台客户端（拿 hint 用），
-    和这里的 client（LLM 客户端）是两回事，别混。
+    client 是 LLM 客户端（必须实现 chat(system, messages, tools)，返回完整
+    content blocks）；bench_client 是平台客户端（拿官方提示用），两个是不同
+    的对象，别混。
     """
     host, hint_ports = parse_targets(started.container_addr)
     if not host:
@@ -1171,7 +1173,7 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
         deadline = time.time() + int(os.environ.get("BENCH_CHALLENGE_SECONDS", "780"))
 
     emit("solve_begin", unique_code=challenge.unique_code, host=host,
-         hint_ports=hint_ports, max_steps=steps,
+         hint_ports=hint_ports, max_turns=steps,
          budget_seconds=int(deadline - time.time()))
 
     verified: list[str] = []
@@ -1203,24 +1205,22 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
 
     # ---- 阶段一：代码侦察（不经过模型）----
     # 图必须在侦察之前建好：侦察阶段就会抓到首页和前端 JS，里面的接口和参数名
-    # 是后面所有假设的原料。
+    # 是后面所有假设的原料。侦察结果同时喂资产图（entry/边）和工作区笔记。
     graph = AttackGraph()
     context.graph = graph
     recon_text = recon_scan(context, board)
-    context.observations.append(
-        Observation(0, "recon", {"host": host, "hint_ports": hint_ports},
-                    recon_text, 0.0, "开场侦察由代码完成"))
     for flag in extract_flags(recon_text):
         submit_flag(flag, 0, "侦察响应提取")
     if board.stats()["services"] == 0:
         emit("solve_blind", unique_code=challenge.unique_code,
              note="端口扫描未发现任何服务，本题可能不可达")
 
-    # ---- 阶段一之后：取平台官方提示 ----
-    # 实测价值极大：a-03 那种「登录页直接 500、所有业务路由都要登录」的题，模型
-    # 自己撞了 25 步全是猜弱 secret 和枚举 404 路径；而平台 hint 一句话就点明了
-    # 漏洞类型和命中位置（「在报表生成和资产搜索功能中输入特殊字符」）。
-    # 取不到（没配 hint / 接口报错）不影响主流程。
+    seed_entries = graph.add_entries(extract_entries(recon_text))
+    if seed_entries:
+        emit("solve_graph_seed", unique_code=challenge.unique_code,
+             new_entries=len(seed_entries), **graph.stats())
+
+    # ---- 平台官方提示：价值远高于模型自己猜，开局就取 ----
     if bench_client is not None and hasattr(bench_client, "get_hint"):
         try:
             hint_result = bench_client.get_hint(challenge.unique_code)
@@ -1234,396 +1234,44 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
             emit("solve_hint", unique_code=challenge.unique_code, hint=text[:300],
                  step=0)
 
-    # ---- 初始化攻击图 ----
-    # 侦察文本里可能已经带了入口（首页 HTML、路由列表），先灌进去。
-    # 没有也没关系：模型跑第一条 curl 之后，输出里的链接会被立刻抽成节点。
-    seed_entries = extract_entries(recon_text)
-    if seed_entries:
-        added = graph.add_entries(seed_entries)
-        emit("solve_graph_seed", unique_code=challenge.unique_code,
-             new_entries=len(added), **graph.stats())
+    # ---- 工作区与探索图（状态外置：notes / todolist / graph 全落盘）----
+    ws_root = os.path.join("/tmp", "ws",
+                           f"{challenge.unique_code}-{int(time.time() * 1000)}")
+    workspace = Workspace(ws_root)
+    explore = ExploreGraph(os.path.join(ws_root, "graph.json"))
 
-    # ---- 阶段二：命令/会话循环 ----
-    last_tool = ""
-    repeat = 0
-    tripwires = 0
-    blocked_streak = 0
-    facts_seen = board.stats()["facts"]
-    stale = 0
-    recon_rounds = 0
-    model_turns = 0
-    for step in range(1, steps + 1):
-        if time.time() >= deadline:
-            emit("solve_timeout", unique_code=challenge.unique_code, step=step)
-            break
-        if len(verified) >= max(1, challenge.flag_count or 1):
-            break
-        if tripwires >= TRIPWIRE_BREAKER:
-            emit("solve_breaker", unique_code=challenge.unique_code, step=step,
-                 note=f"连续 {tripwires} 次命中主动防御话术，本题熔断")
-            break
+    # 官方提示直指漏洞类型与命中位置，优先派 intent。
+    if context.hint:
+        explore.add_intent("web", context.base_url or host,
+                           f"官方提示：{context.hint}", step=0)
+    # 资产图上已有的边按族转成初始 intent；模型认领 intent、按族执行、收口。
+    families_seen: set[str] = set()
+    for edge in graph.pending():
+        if edge.family not in families_seen:
+            families_seen.add(edge.family)
+            explore.add_intent(edge.family,
+                               edge.entry.key if edge.entry else "global",
+                               edge.why, step=0)
+    if not explore.stats()["pending"]:
+        explore.add_intent("recon", context.base_url or host,
+                           "开局侦察：批量路径与入口确认", step=0)
+    workspace.write_todo(
+        "- [ ] 认领一条 intent 并执行（前置：无）\n"
+        "- [ ] 每条利用链的后续步骤在这里按依赖追加（注入 → 凭据 → 登录 → RCE）\n")
+    workspace.append_note("## 开场侦察摘要\n" + recon_text[:1200])
 
-        # ---- 图驱动：图上有能确定性执行的待验证边，这一步就不问模型 ----
-        # 这是整个改动的核心。旧实现每步都让模型在一个无限动作空间里挑，
-        # 于是「已经拿到 file_read 却回头枚举 admin 接口」这类空转必然发生。
-        # 现在只要图里还有边，代码就按优先级自己打；模型只在图耗尽时补位。
-        edge, command = None, ""
-        if context.base_url:
-            for _ in range(8):
-                candidate_edge = graph.next_edge()
-                if candidate_edge is None:
-                    break
-                rendered = graph_exec.render(candidate_edge, context.base_url)
-                if rendered is None:
-                    # 这条边没有确定性打法（上传绕过要构造文件），关掉交给模型
-                    graph.close(candidate_edge)
-                    continue
-                edge, command = candidate_edge, rendered
-                break
-            if edge is None and model_turns > 0 and stale >= RECON_TRIGGER_STALE \
-                    and recon_rounds < MAX_RECON_ROUNDS:
-                # 图上的边全打空了，而且模型也连续几步没进展：回到侦察，长一批
-                # 新入口。这是图的自愈，也是它和「一次性清单」的区别——不会停在
-                # 原地重复同一条命令。
-                #
-                # 门槛是「卡住」而不是「图空」：图空只说明没有确定性的假设可打，
-                # 模型可能正在正确的路上（它能想到图想不到的路径）。开局那轮
-                # 侦察（bulk_probe 已探过 46 条路径）做完之前就抢控制权，既是
-                # 重复劳动，也会把模型该出场的回合直接顶掉。
-                edge = graph.ensure_recon()
-                command = graph_exec.render(edge, context.base_url)
-                if command:
-                    recon_rounds += 1
-
-        if edge is not None and command:
-            started_at = time.time()
-            output = toolkit.run("shell", {"command": command})
-            elapsed = time.time() - started_at
-            verdict = graph_exec.judge(edge, output)
-            edge.attempts += 1
-
-            if verdict["state"] == "worked":
-                graph.mark_worked(edge)
-            elif verdict["state"] == "auth_required":
-                # 打不通是因为没登录。标成 by_auth，登录成功后会被重开——它代表
-                # 「还没权限」，不代表「这个漏洞族不存在」。
-                if edge.entry is not None:
-                    edge.entry.auth = "denied"
-                graph.close(edge, by_auth=True)
-            else:
-                graph.close(edge)
-            for kind, via, detail in verdict["caps"]:
-                graph.add_capability(kind, via, detail)
-
-            # 输出里新出现的链接/表单立刻入图，这是图能自举的关键：
-            # 一条 curl 拿到的页面，下一步就变成若干条待验证边。
-            fresh_entries = graph.add_entries(extract_entries(output))
-            if edge.family == "recon" and not fresh_entries:
-                # 侦察空转没有价值，两次就该收手，把步数让回给模型
-                recon_rounds += 1
-
-            where = edge.entry.key if edge.entry else "global"
-            context.observations.append(Observation(
-                step, f"graph:{edge.family}", {"command": command},
-                output, elapsed, edge.why))
-            emit("solve_step", unique_code=challenge.unique_code, step=step,
-                 tool="shell", thought=f"[图] {edge.family} @ {where} — {edge.why}",
-                 args=json.dumps({"command": command}, ensure_ascii=False)[:200],
-                 output=output[:400], elapsed=round(elapsed, 2),
-                 facts=board.stats()["facts"])
-            emit("solve_graph_edge", unique_code=challenge.unique_code, step=step,
-                 family=edge.family, target=where, state=verdict["state"],
-                 note=(verdict["note"] or "")[:120],
-                 new_entries=len(fresh_entries), **graph.stats())
-
-            for flag in verdict["flags"] + extract_flags(output):
-                submit_flag(flag, step, f"图驱动 {edge.family}")
-            if len(verified) >= max(1, challenge.flag_count or 1):
-                break
-
-            # 图有实质进展才算没卡住：边成功、需要登录（等会话）、拿到新入口或能力
-            if (verdict["state"] in ("worked", "auth_required")
-                    or fresh_entries or verdict["caps"]):
-                stale = 0
-            else:
-                stale += 1
-            if stale >= STALE_ABANDON:
-                emit("solve_abandon", unique_code=challenge.unique_code, step=step,
-                     stale=stale, note="图上的待验证边都打空了，提前收手")
-                break
-            continue
-
-        context.sessions_text = toolkit.session_list()
-        prompt = _build_pick_prompt(challenge, context)
-        started_at = time.time()
-        # 模型调用失败不能直接放弃这道题：并发跑多题时最容易撞到 429/超时，
-        # 一次瞬时错误就把整题扔掉等于白跑。重试 3 次再认输。
-        reply = None
-        for attempt in range(3):
-            try:
-                reply = client.complete(
-                    SYSTEM_PROMPT, messages=[{"role": "user", "content": prompt}])
-                break
-            except Exception as exc:  # noqa: BLE001
-                emit("solve_llm_error", unique_code=challenge.unique_code, step=step,
-                     attempt=attempt + 1, detail=f"{type(exc).__name__}: {exc}"[:200])
-                if attempt < 2:
-                    time.sleep(2 * (attempt + 1))
-        if reply is None:
-            break
-        model_turns += 1
-        text = reply.get("text") or ""
-        action = _extract_json_object(text)
-        if not action:
-            emit("solve_bad_action", unique_code=challenge.unique_code, step=step,
-                 raw=text[:200])
-            # 输出不成 JSON 不该算掉一步：拿同样的上下文再要一次，只把「只输出
-            # 一个 JSON」这句话加在末尾。第二次还是不行才丢掉这一步。
-            retry_prompt = prompt + ("\n\n上一轮的输出不是合法 JSON。只输出一个 JSON "
-                                     "对象，不要任何其它文字、不要代码块标记。")
-            try:
-                again = client.complete(
-                    SYSTEM_PROMPT, messages=[{"role": "user", "content": retry_prompt}])
-                action = _extract_json_object((again or {}).get("text") or "")
-            except Exception as exc:  # noqa: BLE001
-                emit("solve_llm_error", unique_code=challenge.unique_code, step=step,
-                     attempt="json-retry", detail=f"{type(exc).__name__}: {exc}"[:200])
-                action = None
-            if not action:
-                emit("solve_bad_action_giveup", unique_code=challenge.unique_code,
-                     step=step, note="重问一次仍不是 JSON，丢掉这一步")
-                continue
-
-        thought = str(action.get("thought") or action.get("why") or "")[:300]
-
-        # 交卷：疑似即提交，不等确认
-        if "flags" in action and not any(
-                k in action for k in ("cmd", "session", "tool", "pick")):
-            claimed = [str(f).strip() for f in (action.get("flags") or [])
-                       if str(f).strip()]
-            if not claimed:
-                context.observations.append(Observation(
-                    step, "(没收工)", {}, "你还没交任何 flag。若确实拿不到，"
-                    "继续换思路（换协议/换端口/换路径）；不要输出空 flags。",
-                    time.time() - started_at))
-                continue
-            corpus = "\n".join(o.output for o in context.observations)
-            for flag in claimed:
-                source = "模型声明(有出处)" if flag in corpus else "模型声明(无出处)"
-                submit_flag(flag, step, source)
-            emit("solve_final", unique_code=challenge.unique_code, step=step,
-                 thought=thought, verified=len(verified))
-            break
-
-        # 解析动作。cmd / session 是一等公民，pick 与 tool 是兜底。
-        tool, args, label = "", {}, ""
-        if action.get("cmd"):
-            tool, args = "shell", {"command": str(action["cmd"])}
-        elif action.get("session"):
-            kind = str(action["session"]).lower()
-            if kind == "start":
-                tool = "session_start"
-                args = {"command": str(action.get("cmd") or action.get("command") or "")}
-            elif kind == "send":
-                tool = "session_send"
-                args = {"id": action.get("id", 0), "text": str(action.get("text") or "")}
-            elif kind == "read":
-                tool = "session_read"
-                args = {"id": action.get("id", 0), "wait": action.get("wait", 2)}
-            elif kind == "kill":
-                tool = "session_kill"
-                args = {"id": action.get("id", 0)}
-            else:
-                tool, args = "session_list", {}
-        elif action.get("pick"):
-            pick = str(action["pick"])
-            candidate: Candidate | None = next(
-                (c for c in propose(board, 14) if c.id == pick), None)
-            if candidate is None:
-                emit("solve_bad_pick", unique_code=challenge.unique_code,
-                     step=step, pick=pick)
-                context.observations.append(Observation(
-                    step, "(无效候选)", {}, f"候选 {pick} 不存在或已试过。"
-                    "要么从当前列表里挑，要么直接写 cmd 跑命令。",
-                    time.time() - started_at))
-                continue
-            tool, args, label = candidate.tool, candidate.args, candidate.id
-            board.mark_tried(candidate.id)
-        else:
-            tool = str(action.get("tool") or "")
-            args = action.get("args") or {}
-
-        if tool == "custom":
-            context.observations.append(Observation(
-                step, "(要求自定义)", {}, "直接写 {\"cmd\": \"要跑的命令\"}。",
-                time.time() - started_at))
-            continue
-
-        call_args = args if isinstance(args, dict) else {}
-        signature = _cmd_signature(tool, call_args)
-        repeats = context.cmd_seen.get(signature, 0)
-        raw_command = str(call_args.get("command") or call_args.get("cmd") or "")
-        url_sig = (_url_signature(raw_command)
-                   if tool in ("shell", "session_start") and _is_pure_fetch(raw_command)
-                   else "")
-        url_hits = context.url_seen.get(url_sig, 0) if url_sig else 0
-        # 两道去重：同一条命令第三遍拦；同一组 URL「纯抓取」第三遍也拦。
-        # 带 grep/sed/head 这类提取的不拦——同一份响应换关键字问是新的信息，
-        # 拦掉只会让模型在「换写法」和「被拒绝」之间空转。
-        blocked = None
-        if tool in ("shell", "session_start") and repeats >= 2:
-            blocked = ("这条命令", context.cmd_cache.get(signature, ""), repeats)
-        elif url_sig and url_hits >= 2:
-            blocked = ("这组 URL", context.url_cache.get(url_sig, ""), url_hits)
-        # 连续被 URL 去重拦太多次说明提示没起作用，这一轮放行让模型拿回控制权，
-        # 否则它会在「换个说法再试」上把整个步数预算耗光（实跑 10/25 步）。
-        # 只对 URL 维度放行：一字不差的重复命令永远不会产生新信息，没得商量。
-        if blocked and blocked[0] == "这组 URL" and blocked_streak >= 3:
-            emit("solve_dedupe_override", unique_code=challenge.unique_code,
-                 step=step, note="URL 去重连续拦 3 次，本轮放行")
-            blocked = None
-        if blocked:
-            what, cached, hits = blocked
-            blocked_streak += 1
-            output = (f"（拦下）{what}已经抓过 {hits} 次，结果不会变。"
-                      f"换路径/换参数/换攻击点，或者从下面这次输出继续推。\n"
-                      f"上次输出：\n{cached[:600] or '(无)'}")
-            elapsed = time.time() - started_at
-            emit("solve_repeat_blocked", unique_code=challenge.unique_code,
-                 step=step, tool=tool, repeats=hits, kind=what,
-                 streak=blocked_streak)
-        else:
-            blocked_streak = 0
-            output = toolkit.run(tool, call_args)
-            elapsed = time.time() - started_at
-            if tool in ("shell", "session_start"):
-                context.cmd_seen[signature] = repeats + 1
-                context.cmd_cache[signature] = output
-                if url_sig:
-                    context.url_seen[url_sig] = url_hits + 1
-                    context.url_cache[url_sig] = output
-                summary = output.replace("\n", " ")[:110]
-                context.attempts.append(
-                    f"- 第{step}步 {tool} `{signature.split(':', 1)[1][:90]}` → {summary}")
-                # 这一族在这个路径上失败了就记一条，下一轮提示词里会点名。
-                family, path = _attack_family(raw_command)
-                if family and _looks_failed(output) and not extract_flags(output):
-                    key = f"{family} @ {path or '(未指明路径)'}"
-                    fresh = key not in context.excluded
-                    context.excluded[key] = context.excluded.get(key, 0) + 1
-                    if fresh:
-                        emit("solve_excluded", unique_code=challenge.unique_code,
-                             step=step, key=key,
-                             note="这一族在这个路径上失败，下一轮提示词里会点名")
-                # 模型自己跑出来的页面同样要入图：一个 href 带查询串就是一条待验证边。
-                new_entries = graph.add_entries(extract_entries(output))
-                if new_entries:
-                    emit("solve_graph_grow", unique_code=challenge.unique_code,
-                         step=step, new_entries=len(new_entries), **graph.stats())
-                # 模型自己登录成功了，图要知道「会话有了」：之前因缺会话而关掉的
-                # 边要重开，否则模型登录完，图还以为那些入口打不通。
-                if _detect_auth_success(raw_command, output):
-                    if graph.add_capability("auth", "session", "模型自行登录成功"):
-                        emit("solve_graph_auth", unique_code=challenge.unique_code,
-                             step=step, note="模型已取得会话，重开受限入口",
-                             **graph.stats())
-        context.observations.append(
-            Observation(step, tool, call_args, output, elapsed, thought))
-        emit("solve_step", unique_code=challenge.unique_code, step=step, tool=tool,
-             thought=thought, args=json.dumps(args, ensure_ascii=False)[:200],
-             output=output[:400], elapsed=round(elapsed, 2),
-             facts=board.stats()["facts"])
-
-        probe = detect(output)
-        for flag in probe.flags:
-            submit_flag(flag, step, f"{tool} 响应提取")
-        if probe.tripwire:
-            tripwires += 1
-            board.flag_honeypot(f"{host}:{args.get('port', '')}".rstrip(":"))
-            emit("solve_tripwire", unique_code=challenge.unique_code, step=step,
-                 marker=probe.tripwire, tool=tool, count=tripwires)
-        else:
-            tripwires = 0
-        if probe.too_easy:
-            emit("solve_too_easy", unique_code=challenge.unique_code, step=step,
-                 marker=probe.too_easy, note="响应过于配合，疑似蜜罐")
-
-        # 上传成功时把落盘路径记成事实——模型自己会忘。
-        # a-04 实跑：第 7 步传上 shell.php7、第 9 步传上 .htaccess、第 10 步已经
-        # 打出 uid=33，第 18/19 步却在逐个试 shell.php / cmd.php 全是 404，
-        # 因为「哪个文件名是活的」只存在于模型上下文里，一压缩就丢。
-        for uploaded in re.findall(r'"path"\s*:\s*"(uploads/[^"]+)"', output or ""):
-            url = f"{context.base_url.rstrip('/')}/{uploaded}"
-            if board.add(Fact("artifact", f"upload:{uploaded}",
-                              f"已上传 {url}", "high")):
-                emit("solve_upload_recorded", unique_code=challenge.unique_code,
-                     step=step, url=url)
-
-        # curl 读不到本地文件是「上一步写文件失败」的固定症状，连试三遍都一样。
-        # 直接把正确写法塞给模型，比让它自己揣摩快得多。
-        if "(26) Failed to open/read local data" in (output or ""):
-            context.observations.append(Observation(
-                step, "(文件没建成)", {},
-                "curl 报 (26) 说明 -F 要读的本地文件根本不存在——上一步的写文件失败了。"
-                "换成一行的 printf 再传，并且先确认文件真的在：\n"
-                "printf '%s' '<?php echo 1; ?>' > /tmp/x.php && ls -l /tmp/x.php "
-                "&& curl -F 'file=@/tmp/x.php;filename=x.php7' ...",
-                time.time() - started_at))
-
-        # 拿到命令执行是个分水岭：从这一刻起继续挖洞是浪费，该去找 flag 了。
-        # 实跑 a-04 时模型第 10 步就打出了 uid=33(www-data)，之后 8 步还在反复
-        # 重新上传 shell、测试 404 的路径，从没去看 /challenge/flag.txt——那里
-        # 就是答案。所以这里主动把「你已经能执行命令」和「flag 常在哪」怼到眼前，
-        # 并把这条能力记进事实板，后续候选动作也能引用。
-        if _EXEC_PROOF_RE.search(output or "") and not context.rce_found:
-            context.rce_found = True
-            board.add(Fact("rce", f"rce:{host}", "已确认可执行系统命令", "high"))
-            emit("solve_rce", unique_code=challenge.unique_code, step=step,
-                 note="已拿到命令执行，转入找 flag")
-            context.observations.append(Observation(
-                step, "(已执行命令)", {},
-                "你已经能在这个靶标上执行系统命令了。不要再重新上传 shell 或枚举接口，"
-                "直接把这次能用的入口和参数记下来复用，然后按顺序读这几个位置：\n"
-                f"{FLAG_HUNT}\n"
-                "一条命令里可以串多个 cat（`cat A B C 2>/dev/null`），一次读完。",
-                time.time() - started_at))
-
-        # 重复动作检测：连续三次一样就强制换路（模型很容易陷在同一个 curl 里）
-        signature = f"{tool}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
-        repeat = repeat + 1 if signature == last_tool else 1
-        last_tool = signature
-        if repeat >= 3:
-            emit("solve_loop_guard", unique_code=challenge.unique_code, step=step,
-                 tool=tool)
-            repeat = 0
-            context.observations.append(Observation(
-                step, "(重复了)", {},
-                "你连续三次跑同一个动作，不会有新信息。换端口、换协议、换路径，"
-                "或者换一种利用方式。", time.time() - started_at))
-
-        now_facts = board.stats()["facts"]
-        if now_facts > facts_seen:
-            facts_seen = now_facts
-            stale = 0
-        else:
-            stale += 1
-        if stale and stale % 15 == 0:
-            emit("solve_stuck_hint", unique_code=challenge.unique_code,
-                 step=step, stale=stale)
-            context.observations.append(Observation(
-                step, "(卡住了)", {}, _stuck_hint(challenge, step),
-                time.time() - started_at))
-        # 连续 25 步一个新事实都没有，说明这条路走死了。继续烧步数只会挤占
-        # 后面题目的时间——实跑里 a-03..a-16 每题都烧满 60 步、产出为零。
-        if stale >= STALE_ABANDON:
-            emit("solve_abandon", unique_code=challenge.unique_code, step=step,
-                 stale=stale, note="长时间无新事实，提前收手留给第二轮")
-            break
-
-    toolkit.sessions.close_all()
-    emit("solve_done", unique_code=challenge.unique_code,
-         steps=len(context.observations), flags=len(verified),
-         **board.stats())
+    # ---- 阶段二：agent 循环（模型持工具自主推进）----
+    runner = AgentRunner(challenge, client, toolkit, workspace=workspace,
+                         asset_graph=graph, explore=explore,
+                         base_url=context.base_url, max_turns=steps,
+                         deadline=deadline, on_flag=submit_flag)
+    try:
+        summary = runner.run()
+    finally:
+        emit("solve_done", unique_code=challenge.unique_code,
+             verified=len(verified),
+             turns=runner.turns,
+             explore=json.dumps(explore.stats(), ensure_ascii=False))
     return verified
 
 

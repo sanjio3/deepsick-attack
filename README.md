@@ -9,30 +9,40 @@
 - 提交物为 Skill 文件或 ZIP，接受 .md 与 .zip，平台提交记录含 artifact、report、description 字段。
 - 全程无人工纠偏。平台依据真实执行轨迹、网络流量和主机审计日志还原过程，本地补写的轨迹不能替代真实动作。
 
-## 架构
+## 架构（对齐 artex 的多智能体机制）
 
-主干是确定性状态机，由 `stage_runner.py` 按 `config/policy.json` 的 `official_path` 一次推进一个阶段。每个阶段绑定一个退出判据，判据未过时只在本阶段的 fallbacks 内换手段，用完即封锁上报，绝不跨阶段跳步。
+每道题一条持续对话，模型在对话里用原生 tool calls 自主推进（`agent_loop.py`）。
+决策权在模型，确定性代码负责感知、判定与记账：
 
-四个机制各取一个：
-
-- artex：意图-事实-发现血缘与证据门控，落在 `blackboard.py` 与 `verifiers.py`。没有 evidence 文件的观测不算数。
-- Cairn：黑板三原语与局部状态空间搜索，落在 `stage_runner.py` 与 `prompts/planner.md`。搜索空间被压缩到单阶段内部。
-- CAI：异构复核与全链路追踪，落在 `prompts/auditor.md`，替代人在环路审批。
-- garak：probe 与 detector 配对，落在 `stage_runner.check_exit` 与 `trace.jsonl`，每步由确定性代码裁决是否走完。
-
-`path_score.py` 只做验收：LCS 对齐算路径分，检测跳步与捷径，不再用于全局选步。
+- 双图：`attack_graph.py` 是资产图（入口/参数/边=待验证假设的真值库），
+  `explore_graph.py` 是探索图（intent → fact → finding 的血缘链，封锁方向
+  重开必须写新机理）。
+- 状态外置：`workspace.py` 每题一个 /tmp/ws/<题号>/ 工作区——notes.md 黑板、
+  todolist.md 规划待办（串行利用链跨轮推进）、evidence/ 证据目录。对话被
+  GC 不丢事实，planner 每次规划从图上读态势。
+- 双角色同脑：worker 纪律（认领一条 intent、按族战术卡打透、写回 fact、收口）
+  与 planner 纪律（读 overview、更新 todolist、派生新 intent）靠注入指令切换。
+- 战术卡：`skills/` 按漏洞族拆分（recon/lfi/sqli/auth/upload/cmdi/ssti/ssrf/
+  deser/port/flag），认领 intent 时按族加载，主提示词只放纪律不放清单。
+- 证据门控：fact/finding 必须挂证据；flag 交卷记录出处；疑似即交，用平台
+  反馈当判定。
+- 确定性快路径保留：`graph op=auto_probe` 返回资产图上优先级最高的预渲染
+  命令（shell 输出里的 flag 也会被代码直接抓取提交），但用不用由模型决定。
+- LLM：MiniMax-M3.1-Flash 走 Anthropic 兼容协议（`llm.py`），原生 tool_use /
+  tool_result 多轮，system 稳定时命中 prompt cache。
 
 ## 快速开始
 
 零安装入口，直接可用：
 
-python run.py validate
+PYTHONPATH=src python -m deepsick_attack validate
+PYTHONPATH=src python -m deepsick_attack llm-check
+PYTHONPATH=src python -m deepsick_attack bench-solve --only a-04 --log-file logs/run.jsonl
 
-python run.py self-test
+`llm-check` 验证模型连通；`bench-solve --only <题号>` 单题调试（需要 VPN 与
+BENCHMARK_* 凭据，事件流落 --log-file 供复盘）。全量跑分去掉 --only。
 
-python run.py run --target 1
-
-需要命令行工具时再执行 `python -m pip install -e .`，之后可用 `deepsick-attack` 或 `python -m deepsick_attack`。本机若无法联网获取构建依赖，用 `PYTHONPATH=src python -m deepsick_attack validate` 也可以。
+测试：`python -m unittest discover -s tests`，零第三方依赖。
 
 不安装包也可以用 `python -m unittest discover -s tests -v` 直接跑测试，测试模块会自行把 src 加入路径。
 
@@ -40,7 +50,7 @@ python run.py run --target 1
 
 - `config/policy.json`：标准路径、退出判据、备选动作、靶标白名单、评分口径。唯一权威配置。
 - `prompts/`：planner、worker、auditor 三份提交用 Prompt。
-- `src/deepsick_attack/`：正式 Python 包，含 cli、config、models、events、backends、blackboard、stage_runner、path_score、verifiers、agent、submission，以及平台侧的 bench_client、solver、llm、tsecbench。
+- `src/deepsick_attack/`：正式 Python 包。核心：agent_loop（工具循环）、attack_graph（资产图）、explore_graph（探索图）、workspace（工作区）、solver（侦察打底+循环接管）、llm（Anthropic 兼容客户端）；平台侧 bench_client、tsecbench、bench_report。
 - `tests/`：标准库 unittest 用例，零第三方依赖。
 - `build_image.sh`：有 Docker daemon 时的标准构建。
 - `build_image_offline.py`：无 Docker daemon 时按 Registry V2 + `docker save` 归档布局直接组装镜像，零第三方依赖。

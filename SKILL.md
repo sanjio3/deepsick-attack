@@ -17,33 +17,38 @@ description: 智能体安全攻防挑战赛「攻击agent渗透」赛道参赛 S
 
 全程无人工纠偏。审批、纠偏、复核必须在赛前写进代码与 Prompt，运行时不等待任何人工输入。
 
-## 四个机制的落点
+## 机制落点（artex 式）
 
-1. artex 借意图-事实-发现血缘与证据门控。`blackboard.py` 负责状态外置，`verifiers.py` 负责反伪完成清单六条。没有 evidence 文件的观测不算数，版本比对与 CVE 命中不能记为已观测事实。
-2. Cairn 借黑板三原语与局部状态空间搜索。标准动作在实机失败时，只在 `stage_runner.py` 配置的本阶段 fallbacks 内换手段，绝不跨阶段跳步。Hint 由 playbook 自动注入。
-3. CAI 借异构复核与全链路追踪，替代人在环路。`prompts/auditor.md` 要求用不同命令独立复现，`scope_guard` 在代码层拒绝越界目标。
-4. garak 借 probe 与 detector 配对。`official_path` 每个阶段配一个退出判据，由确定性代码裁决这一步是否真的走完；每次 attempt 结构化写入 `trace.jsonl`。
+1. 双图分工：`attack_graph.py` 资产图存入口与待验证边，`explore_graph.py`
+   探索图存 intent/fact/finding 血缘；flag 与封锁都带证据。
+2. 状态外置：`workspace.py` 每题工作区（notes/todolist/evidence），上下文
+   压缩不丢事实；`agent_loop.py` 的 GC 把超长输出归档，正文在图与笔记里。
+3. 双角色同脑：worker 认领 intent 走透、planner 读图派方向，靠注入指令切换；
+   intent 收口或连续空转自动触发规划轮。
+4. 按族战术卡：`src/deepsick_attack/skills/` 十一张卡，认领意图后按族加载，
+   主提示词保持短小。
+5. 原生工具协议：`llm.py` 走 Anthropic 兼容 tool_use/tool_result 多轮对话，
+   不再让模型输出 JSON 文本再解析。
 
 ## 文件清单
 
 - `SKILL.md`：本文件，Skill 入口。
 - `config/policy.json`：主办方标准路径、退出判据、备选动作、靶标白名单、评分口径。唯一权威配置。
-- `src/deepsick_attack/`：正式 Python 包，零第三方依赖。
+- `src/deepsick_attack/`：正式 Python 包，零第三方依赖；核心为 agent_loop / attack_graph / explore_graph / workspace / solver / llm 与 skills/ 战术卡。
 - `prompts/planner.md`、`prompts/worker.md`、`prompts/auditor.md`：三份提交用 Prompt。
 - `tests/`：标准库 unittest 用例。
 - `README.md`、`CONTRIBUTING.md`：工程说明与双人协作规范。
 
 ## 运行
 
-python run.py validate
-
-python run.py self-test
-
-python run.py run --target 1
+python -m deepsick_attack validate
+python -m deepsick_attack llm-check
+python -m deepsick_attack bench-solve --only a-04 --log-file logs/run.jsonl
 
 如需命令行工具，可执行 `python -m pip install -e .` 后使用 `deepsick-attack`。
+测试：`python -m unittest discover -s tests`，零第三方依赖。
 
-离线自检使用预设观测，不发起任何真实网络请求。赛场接入时把 `backends.py` 里的 `LLMClient` 换成真实模型客户端、把 `Executor` 换成授权范围内的确定性工具执行器，主循环与判定器不需要改。
+单题调试用 `bench-solve --only <题号>`；`llm-check` 先验证模型连通与工具协议。
 
 ## 赛前必做
 

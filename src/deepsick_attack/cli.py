@@ -12,8 +12,6 @@ import sys
 from typing import Sequence
 
 from . import __version__
-from .agent import run_target, self_test
-from .backends import MiniMaxLLM
 from .config import ConfigError, DEFAULT_POLICY, DEFAULT_WORKSPACE, load_policy, stage_ids
 from .events import emit, set_log_file
 from .llm import LLMConfigError, LLMError, MiniMaxClient, get_config
@@ -62,17 +60,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("validate", help="只校验配置，不执行任何动作")
     sub.add_parser("llm-check", help="验证 MiniMax key 与模型连通性")
-
-    run = sub.add_parser("run", help="跑单个靶标")
-    run.add_argument("--target", type=int, required=True)
-    run.add_argument("--workspace", default=str(DEFAULT_WORKSPACE))
-    run.add_argument("--max-steps", type=int, default=24)
-    run.add_argument("--backend", choices=["offline", "minimax"], default="offline")
-    run.add_argument("--inject-failure", default=None, metavar="STAGE",
-                     help="自检用：让指定阶段的标准动作失败一次")
-
-    check = sub.add_parser("self-test", help="离线自检，不发真实网络请求")
-    check.add_argument("--workspace", default=str(DEFAULT_WORKSPACE))
 
     pack = sub.add_parser("pack", help="赛前生成提交 ZIP")
     pack.add_argument("--out", default=None)
@@ -172,29 +159,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (LLMConfigError, LLMError) as exc:
             emit("llm_error", detail=str(exc)[:300])
             return 1
-
-    if args.command == "run":
-        try:
-            llm = MiniMaxLLM() if args.backend == "minimax" else None
-        except (LLMConfigError, LLMError) as exc:
-            emit("llm_error", detail=str(exc)[:300])
-            return 1
-        result = run_target(
-            args.target, policy, args.workspace,
-            args.max_steps, args.inject_failure, llm=llm,
-        )
-        emit("result", **result)
-        return 0 if result["proved"] else 1
-
-    if args.command == "self-test":
-        # 自检必须从空工作区开始。Blackboard 是按目标落盘的，上一轮的
-        # trace.jsonl 会让本次「恢复」到已完成的路径上，一步不执行却报
-        # proved=False（反过来也可能掩盖问题）。所以这里用一次性临时目录。
-        import tempfile
-        with tempfile.TemporaryDirectory(prefix="deepsick-selftest-") as tmp:
-            summary = self_test(policy, tmp)
-        return 0 if (summary["normal"]["proved"]
-                     and summary["with_failure"]["proved"]) else 1
 
     if args.command == "pack":
         path = build(args.out)
