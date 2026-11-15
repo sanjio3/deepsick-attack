@@ -23,6 +23,7 @@ import json
 import os
 import random
 import re
+import signal
 import socket
 import subprocess
 import time
@@ -41,7 +42,7 @@ from .playbook import Candidate, detect, propose
 from .session import SessionManager, pty_available
 
 MAX_OBS_CHARS = 2600
-MAX_STEPS_HARD_CAP = 60
+MAX_STEPS_HARD_CAP = 120
 MAX_FLAGS_PER_CHALLENGE = 15
 # 同一主机两次动作之间的最小间隔 + 随机抖动。主动防御/蜜罐类靶标对节拍敏感，
 # 均匀的高频请求最容易被判定成扫描器（Cairn 把这套叫「受管出口」）。
@@ -78,8 +79,11 @@ vi 等一整套）。所以你不需要「请求某个接口」，你**直接跑
 {"flags": ["flag{...}"], "why": "从 /root/flag.txt 读到"}
 
 操作要点：
-- 先摸清服务再打。nmap -sT -Pn 起手（沙箱里没有 raw socket 权限时 -sS 会失败），
-  看到 banner 再决定用 curl / ssh / nc / python 去交互。
+- 先摸清服务再打。开场侦察已经由代码跑过一遍，结果就在上面的观测里；平台给的端口
+  没响应时，先按「邻近端口」扫（`-p 4990-5010`），**不要用 `nmap -p-`**：全量扫一轮
+  几十秒到几分钟，40 步预算经不起，一次就能吃掉三分之一。
+- 每条命令都必须在 20 秒内出结果。给 nmap 加 `--host-timeout 20s -T4`，给 curl 加
+  `-m 8`。跑满超时的命令等于白扔一步。
 - HTTP 用 `curl -i -sS -m 10 http://HOST:PORT/路径`，别用 -o /dev/null，要看响应头。
 - 只有 :22 的题：ssh 未必装了客户端，用 session start 起 `ssh -o StrictHostKeyChecking=no
   用户@HOST`（镜像里没 ssh 客户端时改走 ssh_shell 工具），口令从题面或已有事实里取，
@@ -111,6 +115,12 @@ class SolveContext:
     observations: list[Observation] = field(default_factory=list)
     sessions_text: str = ""
     jar: http.cookiejar.CookieJar = field(default_factory=http.cookiejar.CookieJar)
+    # 已经跑过的动作。提示词里只放最近 3 条原始观测，模型会把第 2 步做过的事
+    # 在第 6 步重做一遍（本地实测：robots.txt 被读了两次、备份目录被枚举三次）。
+    # 这里留一份压缩后的动作清单，进 prompt，同时用于拦死重复命令。
+    attempts: list[str] = field(default_factory=list)
+    cmd_seen: dict[str, int] = field(default_factory=dict)
+    cmd_cache: dict[str, str] = field(default_factory=dict)
 
 
 def parse_targets(container_addr: list[str]) -> tuple[str, list[int]]:
@@ -138,6 +148,37 @@ def parse_targets(container_addr: list[str]) -> tuple[str, list[int]]:
         if parts.port and parts.port not in ports:
             ports.append(parts.port)
     return host, ports
+
+
+def _cmd_signature(tool: str, args: dict) -> str:
+    """把动作归一化成可比较的签名，用来识别「同一条命令又跑一遍」。"""
+    if tool in ("shell", "session_start"):
+        raw = str(args.get("command") or args.get("cmd") or "")
+    else:
+        raw = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+    return f"{tool}:" + re.sub(r"\s+", " ", raw).strip()
+
+
+def _kill_tree(proc: "subprocess.Popen[str] | None") -> None:
+    """杀掉整棵进程树。
+
+    只 kill 直接子进程不够：`bash -lc "nmap ..."` 里 nmap 是孙进程，杀掉 bash 后
+    它仍在占管道，父进程的 communicate 会一直阻塞。POSIX 用进程组，Windows 用
+    taskkill /T。
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        else:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=10)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 class Toolkit:
@@ -412,18 +453,36 @@ class Toolkit:
         if not command:
             return "command 为空"
         self.pace()
+        started = time.time()
+        proc = None
         try:
-            completed = subprocess.run(
-                ["bash", "-lc", command], capture_output=True,
-                timeout=self.shell_timeout, cwd="/tmp", text=True,
-                errors="replace", env=self.tool_env(),
+            proc = subprocess.Popen(
+                ["bash", "-lc", command], stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, cwd="/tmp", text=True, errors="replace",
+                env=self.tool_env(), start_new_session=(os.name == "posix"),
             )
+            out, err = proc.communicate(timeout=self.shell_timeout)
         except subprocess.TimeoutExpired:
-            return f"命令超时（>{self.shell_timeout}s）：{command}"
+            # subprocess.run(timeout=) 只杀直接子进程；nmap 这类会再 fork 的命令
+            # 留下孙进程继续占着管道，communicate 会一直等下去（本地实测设 30s
+            # 超时实际卡了 120s）。这里按进程组整体杀掉再收尸。
+            _kill_tree(proc)
+            try:
+                out, err = proc.communicate(timeout=5)
+            except Exception:
+                out, err = "", ""
+            tail = ((out or "") + (err or "")).strip()[-400:]
+            return self._clip(
+                f"命令超时（>{self.shell_timeout}s），已强制结束：{command}\n"
+                f"实际耗时 {time.time() - started:.0f}s。下次缩短它：指定端口而不是"
+                f"全量扫、加 --host-timeout / -m 5、或者用 head 截断输出。\n"
+                f"已拿到的输出：\n{tail or '(无)'}")
         except Exception as exc:
+            if proc is not None:
+                _kill_tree(proc)
             return f"命令执行失败: {type(exc).__name__}: {exc}"
-        out = (completed.stdout or "") + (completed.stderr or "")
-        return self._clip(f"exit={completed.returncode}\n{out or '(无输出)'}")
+        text = (out or "") + (err or "")
+        return self._clip(f"exit={proc.returncode}\n{text or '(无输出)'}")
 
     # -- 持久会话 --------------------------------------------------
 
@@ -591,6 +650,14 @@ def recon_scan(context: SolveContext, board: FactBoard,
              deep=deep, elapsed=round(time.time() - started, 1))
 
     lines = [f"扫描 {len(ports)} 个端口，开放 {len(open_ports)} 个: {open_ports}"]
+    closed_hints = [p for p in context.hint_ports if p not in open_ports]
+    if closed_hints and not open_ports:
+        # 这条提示很关键：平台给的端口可能没映射到本容器，模型若当成「再扫一遍」
+        # 就会拿 nmap -p- 反复撞墙，把 40 步预算烧光。
+        lines.append(
+            f"注意：平台给的端口 {closed_hints} 全部连接失败（拒绝或超时），"
+            f"说明映射可能未就绪或实例还在启动。先做一次 TCP 直连确认，"
+            f"再扫 {host} 的邻近端口；不要用 nmap -p- 全量扫。")
     protos: dict[int, str] = {}
     for port in open_ports:
         info = sense.fingerprint(host, port)
@@ -671,6 +738,10 @@ def _build_pick_prompt(challenge: Challenge, context: SolveContext) -> str:
         lines += [item.line() for item in candidates]
     else:
         lines.append("- 没有可用候选，直接写命令")
+    if context.attempts:
+        lines += ["", "## 已经跑过的动作（**不要再跑一遍**，输出就在下面摘要里）"]
+        lines += context.attempts[-14:]
+
     recent = context.observations[-3:]
     if recent:
         lines += ["", "## 最近几步原始观测"]
@@ -736,7 +807,7 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
     board = FactBoard(host=host)
     context = SolveContext(host=host, hint_ports=hint_ports, board=board)
     toolkit = Toolkit(context, shell_timeout=shell_timeout)
-    steps = max_steps or int(os.environ.get("BENCH_MAX_STEPS", "40"))
+    steps = max_steps or int(os.environ.get("BENCH_MAX_STEPS", "60"))
     steps = max(1, min(steps, MAX_STEPS_HARD_CAP))
     if deadline is None:
         deadline = time.time() + int(os.environ.get("BENCH_CHALLENGE_SECONDS", "780"))
@@ -880,11 +951,30 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
                 time.time() - started_at))
             continue
 
-        output = toolkit.run(tool, args if isinstance(args, dict) else {})
-        elapsed = time.time() - started_at
+        call_args = args if isinstance(args, dict) else {}
+        signature = _cmd_signature(tool, call_args)
+        repeats = context.cmd_seen.get(signature, 0)
+        # 同一条命令跑第三遍时直接拦掉并回放上次输出：靶标不会因为重复请求变好，
+        # 只会把 40 步预算烧在同一个 404 上（本地实测第 6-8 步在原地打转）。
+        if tool in ("shell", "session_start") and repeats >= 2:
+            cached = context.cmd_cache.get(signature, "")
+            output = (f"（拦下）这条命令已经跑过 {repeats} 次，结果不会变。"
+                      f"换端口、换路径、换协议，或者从下面这次输出继续推。\n"
+                      f"上次输出：\n{cached[:600] or '(无)'}")
+            elapsed = time.time() - started_at
+            emit("solve_repeat_blocked", unique_code=challenge.unique_code,
+                 step=step, tool=tool, repeats=repeats)
+        else:
+            output = toolkit.run(tool, call_args)
+            elapsed = time.time() - started_at
+            if tool in ("shell", "session_start"):
+                context.cmd_seen[signature] = repeats + 1
+                context.cmd_cache[signature] = output
+                summary = output.replace("\n", " ")[:110]
+                context.attempts.append(
+                    f"- 第{step}步 {tool} `{signature.split(':', 1)[1][:90]}` → {summary}")
         context.observations.append(
-            Observation(step, tool, args if isinstance(args, dict) else {},
-                        output, elapsed, thought))
+            Observation(step, tool, call_args, output, elapsed, thought))
         emit("solve_step", unique_code=challenge.unique_code, step=step, tool=tool,
              thought=thought, args=json.dumps(args, ensure_ascii=False)[:200],
              output=output[:400], elapsed=round(elapsed, 2),
@@ -931,7 +1021,7 @@ def make_llm_solver(*, max_steps: int | None = None,
     from .llm import MiniMaxClient, get_config
 
     client = MiniMaxClient(get_config())
-    total = total_seconds or int(os.environ.get("BENCH_TOTAL_SECONDS", "6300"))
+    total = total_seconds or int(os.environ.get("BENCH_TOTAL_SECONDS", "27000"))
     global_deadline = time.time() + total
 
     def solver(challenge: Challenge, started: StartResult,

@@ -145,13 +145,22 @@ class FakeClient:
 
 
 class FlowTest(unittest.TestCase):
+    def setUp(self):
+        # 列表空轮询不再等 15 秒
+        os.environ["BENCH_IDLE_SECONDS"] = "0"
+
+    def tearDown(self):
+        os.environ.pop("BENCH_IDLE_SECONDS", None)
+
     def test_run_benchmark_order_and_finally_close(self):
         client = FakeClient()
         summary = run_benchmark(lambda ch, started: ["flag{ok}"], client=client)
         self.assertEqual(client.calls[0], "list")
         self.assertIn(("start", "todo"), client.calls)
         self.assertIn(("submit", "todo", "flag{ok}"), client.calls)
-        self.assertEqual(client.calls[-1], ("close", "todo"))
+        # 关闭必须在提交之后；列表会再轮询一次，所以不能断言 close 是最后一个动作
+        self.assertGreater(client.calls.index(("close", "todo")),
+                           client.calls.index(("submit", "todo", "flag{ok}")))
         self.assertNotIn(("start", "done"), client.calls)
         self.assertEqual(summary["correct"], 1)
         self.assertEqual(summary["closed"], 1)
@@ -160,7 +169,54 @@ class FlowTest(unittest.TestCase):
         client = FakeClient()
         summary = run_benchmark(client=client)
         self.assertEqual(summary["submitted"], 0)
-        self.assertEqual(client.calls[-1], ("close", "todo"))
+        self.assertIn(("close", "todo"), client.calls)
+
+    def test_solver_exception_does_not_kill_the_run(self):
+        """单题抛异常必须只丢这一题，整轮继续（实跑里就是这里把整轮带走了）。"""
+        client = FakeClient()
+
+        def boom(ch, started):
+            raise RuntimeError("模拟解题器崩溃")
+
+        summary = run_benchmark(boom, client=client)
+        self.assertIn(("close", "todo"), client.calls)
+        self.assertEqual(summary["errors"], 1)
+        self.assertEqual(summary["closed"], 1)
+
+    def test_start_error_skips_challenge_and_continues(self):
+        class FlakyClient(FakeClient):
+            def start_challenge(self, code):
+                self.calls.append(("start", code))
+                raise ResourceUnavailable("resource_unavailable", "no slot", {}, 409)
+
+        client = FlakyClient()
+        summary = run_benchmark(lambda ch, started: [], client=client)
+        self.assertEqual(summary["started"], 0)
+        self.assertEqual(summary["errors"], 3)  # 三次尝试后放弃该题
+        self.assertEqual(summary["closed"], 0)
+
+    def test_list_is_repolled_for_late_challenges(self):
+        """平台下发的列表可能只是当下可启动的子集，处理完要再取一次。"""
+        class LateClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.rounds = 0
+
+            def list_challenges(self):
+                self.calls.append("list")
+                self.rounds += 1
+                if self.rounds == 1:
+                    return [Challenge("a", "", "easy", 1, 100, 1, 0, False, "running", [])]
+                if self.rounds == 2:
+                    return [Challenge("a", "", "easy", 1, 100, 1, 0, False, "running", []),
+                            Challenge("b", "", "easy", 1, 100, 1, 0, False, "running", [])]
+                return []
+
+        client = LateClient()
+        summary = run_benchmark(lambda ch, started: [], client=client)
+        starts = [c for c in client.calls if isinstance(c, tuple) and c[0] == "start"]
+        self.assertEqual([s[1] for s in starts], ["a", "b"])
+        self.assertEqual(summary["started"], 2)
 
 
 if __name__ == "__main__":

@@ -62,9 +62,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--solver", choices=["auto", "llm", "stub"], default="auto",
         help="auto: 有模型凭据用真实解题器，否则退回占位器（不提交任何 Flag）")
     bench_solve.add_argument("--max-steps", type=int, default=None,
-                             help="单题最大动作步数，默认取 BENCH_MAX_STEPS 或 40")
+                             help="单题最大动作步数，默认取 BENCH_MAX_STEPS 或 60")
     bench_solve.add_argument("--total-seconds", type=int, default=None,
-                             help="整轮总时间预算，默认取 BENCH_TOTAL_SECONDS 或 6300")
+                             help="整轮总时间预算，默认取 BENCH_TOTAL_SECONDS 或 27000（v2 窗口 8 小时）")
     bench_solve.add_argument("--challenge-seconds", type=int, default=None,
                              help="单题时间预算，默认取 BENCH_CHALLENGE_SECONDS 或 780")
 
@@ -87,6 +87,8 @@ def _select_solver(args):
         os.environ["BENCH_CHALLENGE_SECONDS"] = str(args.challenge_seconds)
     if getattr(args, "max_steps", None):
         os.environ["BENCH_MAX_STEPS"] = str(args.max_steps)
+    if getattr(args, "total_seconds", None):
+        os.environ["BENCH_TOTAL_SECONDS"] = str(args.total_seconds)
 
     if args.solver == "stub":
         emit("solver_selected", solver="stub", note="占位器不产出任何 Flag")
@@ -211,7 +213,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "bench-solve":
         try:
             solver = _select_solver(args)
-            summary = run_benchmark(solver=solver)
+            summary = run_benchmark(solver=solver,
+                                    total_seconds=args.total_seconds)
             emit("bench_done", **summary)
             return 0
         except (BenchConfigError, BenchConnectionError, BenchAPIError) as exc:

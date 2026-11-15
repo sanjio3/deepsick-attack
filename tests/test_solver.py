@@ -597,6 +597,40 @@ class CmdActionTest(unittest.TestCase):
         self.assertIn(FLAG, flags)
 
 
+class RepeatBlockTest(unittest.TestCase):
+    """同一条命令第三遍必须被拦下。
+
+    本地冒烟实测：第 2 步读 robots.txt，第 6 步又读了一遍，第 7、8 步重复枚举
+    同一个目录。40 步预算经不起这种原地打转。
+    """
+
+    def setUp(self):
+        self.events = []
+        set_sink(self.events.append)
+        self.counter = tempfile.mktemp()
+
+    def tearDown(self):
+        set_sink(None)
+
+    def test_third_identical_command_is_blocked(self):
+        cmd = f"echo hit >> {Path(self.counter).as_posix()}"
+        llm = FakeLLM([json.dumps({"cmd": cmd}) for _ in range(6)])
+        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
+                        llm, deadline=time.time() + 40, max_steps=6)
+        lines = [ln for ln in Path(self.counter).read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(lines), 2, f"重复命令被执行了 {len(lines)} 次")
+        self.assertTrue(any(e["event"] == "solve_repeat_blocked" for e in self.events))
+
+    def test_attempts_are_shown_in_prompt(self):
+        cmd = "echo probe"
+        llm = FakeLLM([json.dumps({"cmd": cmd}),
+                       json.dumps({"cmd": "echo probe2"})])
+        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
+                        llm, deadline=time.time() + 40, max_steps=2)
+        self.assertTrue(any("已经跑过的动作" in p for p in llm.prompts),
+                        "第二轮提示词里必须能看到已跑过的命令")
+
+
 class BreakerTest(unittest.TestCase):
     def setUp(self):
         self.events = []
@@ -614,6 +648,62 @@ class BreakerTest(unittest.TestCase):
                 make_challenge(), StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
                 llm, deadline=time.time() + 40, max_steps=6)
         self.assertTrue(any(e["event"] == "solve_breaker" for e in self.events))
+
+
+class ShellTimeoutTest(unittest.TestCase):
+    """超时必须真的把命令杀掉，不能只杀直接子进程。
+
+    实跑教训：`bash -lc "nmap ..."` 的孙进程会一直占着管道，subprocess.run 的
+    timeout 之后 communicate 还在等，本地实测设 30s 实际卡了 120s。
+    """
+
+    def test_timeout_returns_quickly_and_reports(self):
+        ctx = SolveContext(host="127.0.0.1", hint_ports=[])
+        tk = Toolkit(ctx, shell_timeout=1)
+        started = time.time()
+        out = tk.shell("sleep 30")
+        elapsed = time.time() - started
+        self.assertLess(elapsed, 12, f"超时没生效，实际 {elapsed:.1f}s")
+        self.assertIn("超时", out)
+        self.assertIn("sleep 30", out)
+
+    def test_timeout_kills_grandchild(self):
+        ctx = SolveContext(host="127.0.0.1", hint_ports=[])
+        tk = Toolkit(ctx, shell_timeout=1)
+        started = time.time()
+        tk.shell("bash -c 'sleep 30' ; true")
+        self.assertLess(time.time() - started, 12)
+
+
+class TripwirePrecisionTest(unittest.TestCase):
+    """蜜罐判据只认成句话术。单个词会把 nmap/curl 的正常输出当告警。"""
+
+    def test_nmap_status_line_is_not_tripwire(self):
+        probe = detect("Some closed ports may be reported as filtered due to "
+                       "--defeat-rst-ratelimit")
+        self.assertFalse(probe.tripwire)
+
+    def test_curl_error_is_not_tripwire(self):
+        self.assertFalse(detect("curl: (7) Failed to connect: connection refused").tripwire)
+        self.assertFalse(detect("access blocked by network policy").tripwire)
+
+    def test_real_banner_is_tripwire(self):
+        self.assertTrue(detect("检测到攻击，已记录你的 IP").tripwire)
+        self.assertTrue(detect("Intrusion Detected: your ip has been blocked").tripwire)
+
+
+class ReconHintClosedTest(unittest.TestCase):
+    """提示端口全关闭时，观测里必须明说，避免模型反复 nmap -p- 烧预算。"""
+
+    def test_closed_hint_port_adds_note(self):
+        from unittest import mock
+        ctx = SolveContext(host="10.0.0.9", hint_ports=[5000])
+        board = FactBoard(path=tempfile.mktemp(suffix=".jsonl"), host=ctx.host)
+        with mock.patch.object(sense, "scan", return_value=[]), \
+             mock.patch.object(sense, "mdns_services", return_value=[]):
+            text = recon_scan(ctx, board, emit_events=False)
+        self.assertIn("5000", text)
+        self.assertIn("不要用 nmap -p-", text)
 
 
 class AcceptsSubmitTest(unittest.TestCase):

@@ -14,10 +14,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 # 蜜罐/主动防御的典型话术。命中不直接判死，但会把该服务标成 risky。
+# 只认「成句」的主动防御话术。单个词（detected / blocked / logged / reported /
+# trap）在正常输出里到处都是：nmap 自己就会打印 "Some closed ports may be reported
+# as filtered"，curl 报错里有 "blocked"，把它们当蜜罐证据会把整道题误熔断。
 TRIPWIRE_MARKERS = (
-    "detected", "blocked", "banned", "intrusion", "alarm", "honeypot",
-    "unauthorized access", "logged", "reported", "you have been", "trap",
-    "检测到", "已记录", "已上报", "封禁", "拦截", "蜜罐", "告警", "入侵",
+    "intrusion detected", "attack detected", "honeypot detected",
+    "you have been blocked", "your ip has been blocked", "your address has been blocked",
+    "unauthorized access", "blocked by waf", "waf blocked", "request blocked",
+    "access denied by security", "security policy violation",
+    "检测到攻击", "检测到入侵", "检测到恶意", "已记录你的", "已记录您的",
+    "已上报", "已被封禁", "已封禁", "已被拦截", "已拦截", "触发告警",
 )
 
 # 「太配合」的响应：一次请求就给 root/shell/全部文件，通常不是真漏洞。

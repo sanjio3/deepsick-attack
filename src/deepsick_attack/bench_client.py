@@ -16,6 +16,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -241,56 +242,129 @@ def _accepts_submit(fn) -> bool:
     return any(p.kind == p.VAR_KEYWORD for p in params.values())
 
 
+def _idle_seconds() -> float:
+    """列表没有新题时的重试间隔。测试里设 BENCH_IDLE_SECONDS=0 免得等。"""
+    try:
+        return max(0.0, float(os.environ.get("BENCH_IDLE_SECONDS", "15")))
+    except ValueError:
+        return 15.0
+
+
 def run_benchmark(solver: Callable[[Challenge, StartResult], list[str]] | None = None,
-                  client: ChallengesClient | None = None) -> dict:
-    """按官方顺序驱动一轮评测，串行处理题目，保证最多 1 个活跃容器。"""
+                  client: ChallengesClient | None = None,
+                  total_seconds: int | None = None) -> dict:
+    """按官方顺序驱动一轮评测，串行处理题目，保证最多 1 个活跃容器。
+
+    两条来自实跑教训的硬约束：
+
+    1. **列表要反复轮询，不能只取一次。** 平台下发的题目列表可能只是当下可启动的
+       子集（v2 题集 50 题，实跑只拿到 3 题，处理完进程就退出了，整轮 418 秒结束）。
+    2. **任何单题的异常都不能终止整轮。** 原实现里 start/solve 任一环节抛异常都会
+       冒出 run_benchmark，容器直接退出，平台侧表现为「跑了几分钟就停」。
+    """
     client = client or ChallengesClient()
     solver = solver or stub_solver
-    challenges = client.list_challenges()
-    emit("bench_challenges", count=len(challenges),
-         codes=[ch.unique_code for ch in challenges])
+    total = total_seconds or int(os.environ.get("BENCH_TOTAL_SECONDS", "27000"))
+    deadline = time.time() + total
 
-    summary = {"challenges": len(challenges), "started": 0,
-               "submitted": 0, "correct": 0, "awarded": 0, "closed": 0}
-    for challenge in challenges:
-        if challenge.is_completed:
-            emit("bench_skip", unique_code=challenge.unique_code,
-                 reason="已完成，按官方文档跳过")
-            continue
-        started = client.start_challenge(challenge.unique_code)
-        summary["started"] += 1
-        emit("bench_started", unique_code=challenge.unique_code,
-             container_addr=started.container_addr)
+    summary = {"challenges": 0, "started": 0, "submitted": 0,
+               "correct": 0, "awarded": 0, "closed": 0, "errors": 0,
+               "poll_rounds": 1}
+    seen: set[str] = set()
+    start_failures: dict[str, int] = {}
+    idle_rounds = 0
 
-        def submit_one(flag: str, code: str = challenge.unique_code):
-            """提交一条候选并把结果计入汇总。重复提交按幂等跳过。"""
-            try:
-                result = client.submit_flag(code, flag)
-            except DuplicateSubmit:
-                emit("bench_duplicate", unique_code=code, note="幂等跳过")
-                return SubmitResult(correct=False, awarded=0,
-                                    correct_flag_count=0, total_flag_count=0)
-            summary["submitted"] += 1
-            if result.correct:
-                summary["correct"] += 1
-                summary["awarded"] += result.awarded
-            emit("bench_submit", unique_code=code, correct=result.correct,
-                 awarded=result.awarded,
-                 progress=f"{result.correct_flag_count}/{result.total_flag_count}")
-            return result
-
-        live = _accepts_submit(solver)
+    while time.time() < deadline:
         try:
-            if live:
-                # 解题器自己提交，用平台反馈决定是否继续挖
-                solver(challenge, started, submit=submit_one)
-            else:
-                for flag in list(solver(challenge, started) or []):
-                    submit_one(flag)
-        finally:
-            closed = client.close_challenge(challenge.unique_code)
-            summary["closed"] += 1
-            emit("bench_closed", unique_code=challenge.unique_code,
-                 closed=closed.closed)
+            challenges = client.list_challenges()
+        except BenchAPIError as exc:
+            summary["errors"] += 1
+            emit("bench_list_error", detail=str(exc)[:200],
+                 note="重新取一次列表")
+            time.sleep(_idle_seconds())
+            continue
+        summary["challenges"] = max(summary["challenges"], len(challenges))
+        fresh = [c for c in challenges
+                 if not c.is_completed and c.unique_code not in seen
+                 and start_failures.get(c.unique_code, 0) < 3]
+        if not fresh:
+            emit("bench_poll_empty", round=summary["poll_rounds"],
+                 known=len(seen), listed=len(challenges),
+                 note="没有可跑的新题，稍后重新取列表")
+            idle_rounds += 1
+            if idle_rounds >= 2:
+                emit("bench_exhausted", known=len(seen), listed=len(challenges))
+                break
+            time.sleep(_idle_seconds())
+            summary["poll_rounds"] += 1
+            continue
+        idle_rounds = 0
+
+        for challenge in fresh:
+            if time.time() >= deadline:
+                break
+            code = challenge.unique_code
+            try:
+                started = client.start_challenge(code)
+            except Exception as exc:  # noqa: BLE001
+                start_failures[code] = start_failures.get(code, 0) + 1
+                summary["errors"] += 1
+                emit("bench_start_error", unique_code=code,
+                     detail=f"{type(exc).__name__}: {exc}"[:200],
+                     attempt=start_failures[code],
+                     note="跳过该题，继续下一题")
+                continue
+            seen.add(code)  # 只有真正启动成功才标记已处理，启动失败留给下一轮重试
+            summary["started"] += 1
+            emit("bench_started", unique_code=code,
+                 container_addr=started.container_addr)
+
+            def submit_one(flag: str, _code: str = code):
+                """提交一条候选并把结果计入汇总。重复提交按幂等跳过。"""
+                try:
+                    result = client.submit_flag(_code, flag)
+                except DuplicateSubmit:
+                    emit("bench_duplicate", unique_code=_code, note="幂等跳过")
+                    return SubmitResult(correct=False, awarded=0,
+                                        correct_flag_count=0, total_flag_count=0)
+                except Exception as exc:  # noqa: BLE001
+                    emit("bench_submit_error", unique_code=_code,
+                         detail=f"{type(exc).__name__}: {exc}"[:200])
+                    return SubmitResult(correct=False, awarded=0,
+                                        correct_flag_count=0, total_flag_count=0)
+                summary["submitted"] += 1
+                if result.correct:
+                    summary["correct"] += 1
+                    summary["awarded"] += result.awarded
+                emit("bench_submit", unique_code=_code, correct=result.correct,
+                     awarded=result.awarded,
+                     progress=f"{result.correct_flag_count}/{result.total_flag_count}")
+                return result
+
+            live = _accepts_submit(solver)
+            try:
+                if live:
+                    # 解题器自己提交，用平台反馈决定是否继续挖
+                    solver(challenge, started, submit=submit_one)
+                else:
+                    for flag in list(solver(challenge, started) or []):
+                        submit_one(flag)
+            except Exception as exc:  # noqa: BLE001
+                summary["errors"] += 1
+                emit("bench_challenge_error", unique_code=code,
+                     detail=f"{type(exc).__name__}: {exc}"[:300],
+                     note="此题异常，继续下一题（不再终止整轮）")
+            finally:
+                try:
+                    closed = client.close_challenge(code)
+                    summary["closed"] += 1
+                    emit("bench_closed", unique_code=code, closed=closed.closed)
+                except Exception as exc:  # noqa: BLE001
+                    summary["errors"] += 1
+                    emit("bench_close_error", unique_code=code,
+                         detail=f"{type(exc).__name__}: {exc}"[:200])
+
+        summary["poll_rounds"] += 1
+
     emit("bench_summary", **summary)
     return summary
