@@ -1,0 +1,14 @@
+.env
+.git
+.gitignore
+dist/
+workspace/
+ci-workspace/
+__pycache__/
+*.pyc
+*.pyo
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.log

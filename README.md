@@ -83,6 +83,18 @@ python run.py bench-run --set bs-6c730ae2487f
 
 题集列表与详情可匿名读取；创建评测需要平台 OAuth token，通过环境变量 `TSECBENCH_TOKEN` 提供，不要写进项目文件。评测平台会记录执行轨迹与工具调用，本地补写的轨迹不能替代真实动作。
 
+## 平台托管镜像
+
+`Dockerfile` 以 `python:3.11-slim` 为基础，零 pip 依赖，入口为 `python -m deepsick_attack bench-solve`。`.dockerignore` 已排除 `.env` 与所有运行产物，凭据不会进入镜像。
+
+bash build_image.sh
+
+产出 `dist/deepsick-attack-image.tar.gz`，对应平台「上传 Agent 镜像」要求的 `.tar.gz`。平台在创建跑分任务后注入 `BENCHMARK_TOKEN` 与 `BENCHMARK_BASE_URL`；模型侧通过环境变量 `MINIMAX_API_KEY`（托管沙箱内指向网关地址）注入。
+
+答题流程按平台官方《Challenges API 接入文档》实现，位于 `src/deepsick_attack/bench_client.py`：header `BENCHMARK_TOKEN` 鉴权，顺序为 list → start → submit → close，串行执行以保证活跃容器不超过 3 个；hint 接口会扣减得分，默认不调用；`duplicate` 幂等跳过；`finally` 中必定 close。官方 SDK 为 `tsec-benchmark`，本项目用标准库实现同一协议以避免镜像依赖 pip 网络。
+
+需要明确的是：`bench-solve` 目前使用 `stub_solver`，只驱动平台流程而不产出 Flag，因为真实靶标执行器尚未接入。镜像可以跑通协议，但还不能真正得分。
+
 ## CI 状态
 
 GitHub Actions 工作流配置保存在 `docs/ci-workflow.yml`。当前 GitHub 令牌缺少 `workflow` scope，无法推送 `.github/workflows/` 下的文件，因此 Actions 暂未启用。补齐 scope 后把该文件移到 `.github/workflows/ci.yml` 并提交即可启用，CI 会在 Python 3.10 到 3.13 上跑同一组单测、配置校验与离线自检。

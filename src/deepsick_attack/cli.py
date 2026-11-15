@@ -16,6 +16,12 @@ from .backends import MiniMaxLLM
 from .config import ConfigError, DEFAULT_POLICY, DEFAULT_WORKSPACE, load_policy, stage_ids
 from .events import emit
 from .llm import LLMConfigError, LLMError, MiniMaxClient, get_config
+from .bench_client import (
+    BenchAPIError,
+    BenchConfigError,
+    BenchConnectionError,
+    run_benchmark,
+)
 from .submission import build
 from .tsecbench import BenchError, create_run, get_set, list_sets
 
@@ -49,6 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     pack.add_argument("--out", default=None)
 
     sub.add_parser("bench-sets", help="列出 TSecBench 公开题集，无需 token")
+    sub.add_parser("bench-solve", help="按平台官方协议跑一轮答题流程，需 BENCHMARK_* 环境变量")
 
     bench_set = sub.add_parser("bench-set", help="查看单个题集详情，无需 token")
     bench_set.add_argument("--set", required=True, metavar="SET_ID")
@@ -149,6 +156,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             emit("bench_run_created", run=result)
             return 0
         except BenchError as exc:
+            emit("bench_error", detail=str(exc)[:300])
+            return 1
+
+    if args.command == "bench-solve":
+        try:
+            summary = run_benchmark()
+            emit("bench_done", **summary)
+            return 0
+        except (BenchConfigError, BenchConnectionError, BenchAPIError) as exc:
             emit("bench_error", detail=str(exc)[:300])
             return 1
 
