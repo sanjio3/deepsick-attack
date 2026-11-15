@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import base64
 import concurrent.futures
 import re
 import socket
@@ -432,6 +433,44 @@ def extract_secrets(text: str, limit: int = 8) -> list[str]:
         seen.add(key)
         out.append(key)
     return out[:limit]
+
+
+# base64 候选：前端代码里很常见（注释掉的密码、硬编码 token、混淆的配置）
+_B64_RE = re.compile(r"""["'`]([A-Za-z0-9+/]{8,64}={0,2})["'`]""")
+# 解码后像凭据的特征词
+_CRED_WORDS = ("password", "passwd", "admin", "root", "secret", "token",
+               "123456", "username", "pwd", "credential", "login")
+
+
+def extract_encoded_secrets(text: str, limit: int = 8) -> list[str]:
+    """从前端代码里找 base64 编码的凭据并解出来。
+
+    a-17 的 hint 是「前端代码里是不是留下了什么蛛丝马迹」——实测模型为此把
+    前端 JS 读了五遍，每遍只 grep 关键词，始终没把藏在 base64 里的凭据用上。
+    这类活该由代码做：成本 0 步，而且不会漏。
+    """
+    out: list[str] = []
+    for match in _B64_RE.finditer(text or ""):
+        blob = match.group(1)
+        if len(blob) % 4:
+            blob += "=" * (4 - len(blob) % 4)
+        try:
+            decoded = base64.b64decode(blob, validate=False).decode("utf-8", "replace")
+        except Exception:
+            continue
+        if len(decoded) < 4 or not decoded.isprintable():
+            continue
+        if not any(word in decoded.lower() for word in _CRED_WORDS):
+            continue
+        # 解出来常常是一段 JSON 片段（['admin','password123']），拼成 user:pass
+        parts = [p.strip(" '\"[]") for p in re.split(r"[,\s]+", decoded)
+                 if p.strip(" '\"[]")]
+        item = f"{parts[0]}:{parts[1]}" if len(parts) >= 2 else decoded
+        if item not in out:
+            out.append(item)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def combine_routes(routes: list[str], limit: int = 24) -> list[str]:

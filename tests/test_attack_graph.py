@@ -119,6 +119,28 @@ class CmdInjectTest(unittest.TestCase):
         self.assertEqual(verdict["caps"][0][0], "rce")
 
 
+class CredsFlowTest(unittest.TestCase):
+    """前端代码里翻出来的凭据必须直接进登录尝试表，不能让模型自己读 JS。"""
+
+    def test_creds_reach_auth_edge_command(self):
+        graph = AttackGraph()
+        graph.add_entries([Entry("POST", "/login.php",
+                                 {"username": "generic", "password": "generic"})])
+        graph.add_creds(["admin:admin123"])
+        edge = [e for e in graph.edges.values() if e.family == "auth"][0]
+        cmd = graph_exec.render(edge, "http://10.0.0.1")
+        self.assertIn("admin:admin123", cmd)
+
+    def test_creds_added_after_edge_creation_still_apply(self):
+        graph = AttackGraph()
+        graph.add_entries([Entry("POST", "/login.php",
+                                 {"username": "generic", "password": "generic"})])
+        edge = [e for e in graph.edges.values() if e.family == "auth"][0]
+        graph.add_creds(["root:toor"])
+        cmd = graph_exec.render(edge, "http://10.0.0.1")
+        self.assertIn("root:toor", cmd)
+
+
 class ClassifyParamTest(unittest.TestCase):
     def test_file_extension_wins_on_file_param_name(self):
         # id 的值是 .pdf，说明服务端拿它当路径用

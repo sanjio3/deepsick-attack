@@ -36,6 +36,7 @@ artex 里那套「意图-事实-发现血缘」落到这里就是一张有向图
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -392,7 +393,9 @@ def derive(entry: Entry) -> list[Edge]:
     has_user = bool(names & {"username", "user", "email", "account", "uname", "login"})
     has_pass = bool(names & {"password", "pass", "pwd", "passwd"})
     if entry.method.upper() == "POST" and has_user and has_pass:
-        edges.append(Edge("auth", entry, why="登录表单：先用少量常见凭据拿会话"))
+        edges.append(Edge("auth", entry,
+                          payload_note=json.dumps([], ensure_ascii=False),
+                          why="登录表单：先用少量常见凭据拿会话"))
 
     if "file" in kinds:
         edges.append(Edge("lfi", entry,
@@ -431,8 +434,26 @@ class AttackGraph:
         self.caps: dict[str, Capability] = {}
         self.closed: set[str] = set()      # 已确定失败的边，不再派发
         self.blocked_by_auth: set[str] = set()   # 因缺会话而失败的边，登录后要重开
+        self.creds: list[str] = []         # 已发现的凭据，喂给 auth 边
 
     # ---- 写入 ----
+
+    def add_creds(self, creds: list[str]) -> None:
+        """把新发现的凭据喂给所有 auth 边。
+
+        前端代码里翻出来的凭据（尤其是 base64 藏的）应该直接进登录尝试表，
+        而不是让模型自己去 JS 里读五遍再手工拼命令。
+        """
+        if not creds:
+            return
+        known = set(self.creds)
+        fresh = [c for c in creds if c and c not in known]
+        if not fresh:
+            return
+        self.creds.extend(fresh)
+        for edge in self.edges.values():
+            if edge.family == "auth":
+                edge.payload_note = json.dumps(self.creds, ensure_ascii=False)
 
     def add_entries(self, entries: list[Entry]) -> list[Entry]:
         """新入口入图，并为它派生出待验证边。返回真正新增的那些。"""

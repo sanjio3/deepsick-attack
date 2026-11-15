@@ -243,7 +243,7 @@ STUCK_HINTS = (
 )
 
 
-def _discover_routes(base_url: str) -> tuple[list[str], list[str], int, list[Entry]]:
+def _discover_routes(base_url: str) -> tuple[list[str], list[str], int, list[Entry], list[str]]:
     """抓首页与前端 JS，抽出路由、硬编码凭据和带参数的攻击面。
 
     第四项是给攻击图用的：前端脚本里的 API 调用带着方法和请求体参数名，这些
@@ -256,7 +256,7 @@ def _discover_routes(base_url: str) -> tuple[list[str], list[str], int, list[Ent
         with opener.open(base + "/", timeout=6) as response:
             html = response.read(300_000).decode("utf-8", "replace")
     except Exception:
-        return [], [], 0, []
+        return [], [], 0, [], []
     scripts = sense.fetch_assets(base, html)
     routes = sense.extract_routes(html, scripts)
     secrets = sense.extract_secrets(scripts + "\n" + html)
@@ -266,7 +266,10 @@ def _discover_routes(base_url: str) -> tuple[list[str], list[str], int, list[Ent
         entries = extract_entries(html + "\n" + scripts)
     except Exception:
         entries = []
-    return routes, secrets, len(scripts), entries
+    # 前端代码里 base64 藏的凭据：这类活该由代码干，成本 0 步。a-17 实测模型
+    # 为此把前端 JS 读了五遍，每遍只 grep 关键词，始终没把凭据用上。
+    encoded = sense.extract_encoded_secrets(scripts + "\n" + html)
+    return routes, secrets, len(scripts), entries, encoded
 
 
 def _detect_auth_success(command: str, output: str) -> bool:
@@ -934,13 +937,21 @@ def recon_scan(context: SolveContext, board: FactBoard,
     # 路由与凭据发现：首页 + 它引用的 JS，抽路径与硬编码 key。
     # 这是纯确定性工作，不该花模型步数——实测模型会为同一个 app.js 反复下载六次。
     if context.base_url.startswith("http"):
-        routes, secrets, js_len, api_entries = _discover_routes(context.base_url)
+        routes, secrets, js_len, api_entries, encoded_creds = _discover_routes(context.base_url)
         # 前端 JS 里的接口和参数名直接入图：这是「事实驱动」的原料，
         # 模型不用再自己花十几步去 JS 里翻参数名。
         if context.graph is not None and api_entries:
             added = context.graph.add_entries(api_entries)
             emit("solve_graph_seed", base=context.base_url,
                  new_entries=len(added), **context.graph.stats())
+        if encoded_creds:
+            for item in encoded_creds:
+                board.add(Fact("credential", f"encoded:{item}",
+                               f"前端代码里解出的凭据 {item}", "high"))
+            if context.graph is not None:
+                context.graph.add_creds(encoded_creds)
+            lines.append(f" 前端代码里解出的凭据 {len(encoded_creds)} 条："
+                         + ", ".join(encoded_creds[:6]))
         if routes:
             lines.append(f" 前端路由/接口 {len(routes)} 个：" + ", ".join(routes[:18]))
             for route in routes[:18]:
