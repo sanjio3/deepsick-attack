@@ -53,6 +53,14 @@ JITTER = 0.7
 TRIPWIRE_BREAKER = 3
 # 图上的边全打空后，最多自动回到侦察几轮。再多就是真的没牌了，该交给模型。
 MAX_RECON_ROUNDS = 3
+# 连续多少步没有新事实才让图回到侦察。图空 ≠ 卡住，模型可能正在正确的路上。
+RECON_TRIGGER_STALE = 6
+# 识别「模型自己登录成功了」的信号：命令里出现口令字段，响应里发了会话 cookie。
+_SESSION_COOKIE_RE = re.compile(
+    r"Set-Cookie:\s*(?:PHPSESSID|session|jsessionid|sessid|SESSID|connect\.sid)"
+    r"=([A-Za-z0-9_\-]{8,})", re.I)
+_LOGIN_HINT_RE = re.compile(
+    r"(?:password|passwd|pwd)\s*=|login|signin|登录|认证", re.I)
 # 连续多少步没有新事实就放弃这道题
 STALE_ABANDON = 25
 BANNER_CLIP = 700
@@ -235,21 +243,44 @@ STUCK_HINTS = (
 )
 
 
-def _discover_routes(base_url: str) -> tuple[list[str], list[str], int]:
-    """抓首页与前端 JS，抽出路由和硬编码凭据。失败就返回空，不影响侦察。"""
+def _discover_routes(base_url: str) -> tuple[list[str], list[str], int, list[Entry]]:
+    """抓首页与前端 JS，抽出路由、硬编码凭据和带参数的攻击面。
+
+    第四项是给攻击图用的：前端脚本里的 API 调用带着方法和请求体参数名，这些
+    参数名是「这个接口该按什么语义打」的唯一依据。丢掉它们，图就派不出边，
+    模型只能自己花十几步去 JS 里翻——a-09 实跑就是这样耗掉 19 步还没转出边。
+    """
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     base = base_url.rstrip("/")
     try:
         with opener.open(base + "/", timeout=6) as response:
             html = response.read(300_000).decode("utf-8", "replace")
     except Exception:
-        return [], [], 0
+        return [], [], 0, []
     scripts = sense.fetch_assets(base, html)
     routes = sense.extract_routes(html, scripts)
     secrets = sense.extract_secrets(scripts + "\n" + html)
     emit("recon_routes", base=base, routes=len(routes),
          secrets=len(secrets), js_chars=len(scripts))
-    return routes, secrets, len(scripts)
+    try:
+        entries = extract_entries(html + "\n" + scripts)
+    except Exception:
+        entries = []
+    return routes, secrets, len(scripts), entries
+
+
+def _detect_auth_success(command: str, output: str) -> bool:
+    """模型自己跑出了登录成功的迹象。
+
+    图能派 auth 边，但只带少量常见凭据；模型要是注册了新账号或试出了别的口令，
+    图必须知道「会话已经有了」，否则之前因缺会话而关掉的边不会重开。
+    """
+    if not _LOGIN_HINT_RE.search(command or ""):
+        return False
+    if _SESSION_COOKIE_RE.search(output or ""):
+        return True
+    return bool(re.search(r"(登录成功|LOGIN_OK|login success|authenticated)",
+                          output or "", re.I))
 
 
 def _stuck_hint(challenge: Challenge, step: int) -> str:
@@ -896,7 +927,13 @@ def recon_scan(context: SolveContext, board: FactBoard,
     # 路由与凭据发现：首页 + 它引用的 JS，抽路径与硬编码 key。
     # 这是纯确定性工作，不该花模型步数——实测模型会为同一个 app.js 反复下载六次。
     if context.base_url.startswith("http"):
-        routes, secrets, js_len = _discover_routes(context.base_url)
+        routes, secrets, js_len, api_entries = _discover_routes(context.base_url)
+        # 前端 JS 里的接口和参数名直接入图：这是「事实驱动」的原料，
+        # 模型不用再自己花十几步去 JS 里翻参数名。
+        if context.graph is not None and api_entries:
+            added = context.graph.add_entries(api_entries)
+            emit("solve_graph_seed", base=context.base_url,
+                 new_entries=len(added), **context.graph.stats())
         if routes:
             lines.append(f" 前端路由/接口 {len(routes)} 个：" + ", ".join(routes[:18]))
             for route in routes[:18]:
@@ -1143,6 +1180,10 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
         return correct
 
     # ---- 阶段一：代码侦察（不经过模型）----
+    # 图必须在侦察之前建好：侦察阶段就会抓到首页和前端 JS，里面的接口和参数名
+    # 是后面所有假设的原料。
+    graph = AttackGraph()
+    context.graph = graph
     recon_text = recon_scan(context, board)
     context.observations.append(
         Observation(0, "recon", {"host": host, "hint_ports": hint_ports},
@@ -1174,8 +1215,6 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
     # ---- 初始化攻击图 ----
     # 侦察文本里可能已经带了入口（首页 HTML、路由列表），先灌进去。
     # 没有也没关系：模型跑第一条 curl 之后，输出里的链接会被立刻抽成节点。
-    graph = AttackGraph()
-    context.graph = graph
     seed_entries = extract_entries(recon_text)
     if seed_entries:
         added = graph.add_entries(seed_entries)
@@ -1190,6 +1229,7 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
     facts_seen = board.stats()["facts"]
     stale = 0
     recon_rounds = 0
+    model_turns = 0
     for step in range(1, steps + 1):
         if time.time() >= deadline:
             emit("solve_timeout", unique_code=challenge.unique_code, step=step)
@@ -1218,9 +1258,16 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
                     continue
                 edge, command = candidate_edge, rendered
                 break
-            if edge is None and recon_rounds < MAX_RECON_ROUNDS:
-                # 图上的边全打空了：回到侦察，长一批新入口。这是图的自愈，
-                # 也是它和「一次性清单」的区别——不会停在原地重复同一条命令。
+            if edge is None and model_turns > 0 and stale >= RECON_TRIGGER_STALE \
+                    and recon_rounds < MAX_RECON_ROUNDS:
+                # 图上的边全打空了，而且模型也连续几步没进展：回到侦察，长一批
+                # 新入口。这是图的自愈，也是它和「一次性清单」的区别——不会停在
+                # 原地重复同一条命令。
+                #
+                # 门槛是「卡住」而不是「图空」：图空只说明没有确定性的假设可打，
+                # 模型可能正在正确的路上（它能想到图想不到的路径）。开局那轮
+                # 侦察（bulk_probe 已探过 46 条路径）做完之前就抢控制权，既是
+                # 重复劳动，也会把模型该出场的回合直接顶掉。
                 edge = graph.ensure_recon()
                 command = graph_exec.render(edge, context.base_url)
                 if command:
@@ -1236,11 +1283,11 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
             if verdict["state"] == "worked":
                 graph.mark_worked(edge)
             elif verdict["state"] == "auth_required":
-                # 打不通是因为没登录。标成 denied，登录成功后 add_capability("auth")
-                # 会把这条边重新变成 pending，而不是当成「这个族不存在」。
+                # 打不通是因为没登录。标成 by_auth，登录成功后会被重开——它代表
+                # 「还没权限」，不代表「这个漏洞族不存在」。
                 if edge.entry is not None:
                     edge.entry.auth = "denied"
-                graph.close(edge)
+                graph.close(edge, by_auth=True)
             else:
                 graph.close(edge)
             for kind, via, detail in verdict["caps"]:
@@ -1299,6 +1346,7 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
                     time.sleep(2 * (attempt + 1))
         if reply is None:
             break
+        model_turns += 1
         text = reply.get("text") or ""
         action = _extract_json_object(text)
         if not action:
@@ -1447,6 +1495,13 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
                 if new_entries:
                     emit("solve_graph_grow", unique_code=challenge.unique_code,
                          step=step, new_entries=len(new_entries), **graph.stats())
+                # 模型自己登录成功了，图要知道「会话有了」：之前因缺会话而关掉的
+                # 边要重开，否则模型登录完，图还以为那些入口打不通。
+                if _detect_auth_success(raw_command, output):
+                    if graph.add_capability("auth", "session", "模型自行登录成功"):
+                        emit("solve_graph_auth", unique_code=challenge.unique_code,
+                             step=step, note="模型已取得会话，重开受限入口",
+                             **graph.stats())
         context.observations.append(
             Observation(step, tool, call_args, output, elapsed, thought))
         emit("solve_step", unique_code=challenge.unique_code, step=step, tool=tool,

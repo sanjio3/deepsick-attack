@@ -36,6 +36,89 @@ SEARCH_HTML = """
 """
 
 
+class ApiSpecTest(unittest.TestCase):
+    """前端脚本里的 API 调用必须能抽出方法和参数名，否则图派不出边。"""
+
+    JS = """
+    fetch('/api/auth/login', {method: 'POST', body: JSON.stringify({username: 'a', password: 'b'})});
+    axios.post('/api/report/export', {report_id: 1, filename: 'out.pdf'});
+    axios.get('/api/reports');
+    $.ajax({url: '/api/files', method: 'POST', data: {path: 'x', q: 'y'}});
+    """
+
+    def _by_path(self, method: str, path: str):
+        for entry in extract_entries(self.JS):
+            if entry.method == method and entry.path == path:
+                return entry
+        return None
+
+    def test_pulls_axios_post_with_body_params(self):
+        entry = self._by_path("POST", "/api/report/export")
+        self.assertIsNotNone(entry)
+        # filename 的语义是 file（路径穿越族），report_id 的语义是 id（越权族）
+        self.assertEqual(entry.params.get("filename"), "file")
+        self.assertEqual(entry.params.get("report_id"), "id")
+
+    def test_pulls_fetch_with_explicit_method(self):
+        entry = self._by_path("POST", "/api/auth/login")
+        self.assertIsNotNone(entry)
+        # fetch 的参数在 JSON.stringify 里面，不该把外层 body/method 当参数
+        self.assertIn("username", entry.params)
+        self.assertNotIn("body", entry.params)
+
+    def test_does_not_borrow_next_block_params(self):
+        entry = self._by_path("GET", "/api/reports")
+        self.assertIsNotNone(entry)
+        # axios.get 后面没有对象字面量，不能把下一个 ajax 的参数吃进来
+        self.assertEqual(entry.params, {})
+
+    def test_pulls_ajax_data_params(self):
+        entry = self._by_path("POST", "/api/files")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.params.get("path"), "file")
+        self.assertEqual(entry.params.get("q"), "search")
+
+    def test_api_params_drive_edge_derivation(self):
+        entry = self._by_path("POST", "/api/report/export")
+        fams = {e.family for e in derive(entry)}
+        self.assertIn("lfi", fams)
+        self.assertIn("idor", fams)
+
+
+class CmdInjectTest(unittest.TestCase):
+    """文件名参数拼进 shell 时就是命令注入。a-09 的导出接口正是这个形状。"""
+
+    def test_post_filename_param_derives_cmd_inject(self):
+        entry = Entry("POST", "/api.php", {"report_id": "id", "filename": "file"})
+        self.assertIn("cmd_inject", {e.family for e in derive(entry)})
+
+    def test_get_download_id_param_does_not_derive_cmd_inject(self):
+        # a-05 的 download.php?id= 是读文件，不是写文件，别浪费步数试注入
+        entry = Entry("GET", "/download.php", {"id": "file"})
+        self.assertNotIn("cmd_inject", {e.family for e in derive(entry)})
+
+    def test_render_covers_id_combinations_and_readback_payload(self):
+        entry = Entry("POST", "api.php", {"report_id": "id", "filename": "file"},
+                      relative=True)
+        cmd = graph_exec.render(Edge("cmd_inject", entry), "http://10.0.0.1")
+        self.assertIn("cat /challenge/flag.txt", cmd)
+        self.assertIn("report_id=2", cmd)
+        self.assertIn("report_id=3", cmd)
+        self.assertNotIn("\n", cmd)
+
+    def test_relative_path_is_joined_with_base_url(self):
+        entry = Entry("POST", "api.php?action=export", {"filename": "file"},
+                      relative=True)
+        cmd = graph_exec.render(Edge("cmd_inject", entry), "http://10.0.0.1")
+        self.assertIn("http://10.0.0.1/api.php?action=export", cmd)
+
+    def test_judge_detects_command_execution(self):
+        edge = Edge("cmd_inject", Entry("POST", "/api.php", {"filename": "file"}))
+        verdict = graph_exec.judge(edge, "uid=33(www-data) gid=33(www-data)")
+        self.assertEqual(verdict["state"], "worked")
+        self.assertEqual(verdict["caps"][0][0], "rce")
+
+
 class ClassifyParamTest(unittest.TestCase):
     def test_file_extension_wins_on_file_param_name(self):
         # id 的值是 .pdf，说明服务端拿它当路径用
@@ -121,20 +204,32 @@ class GraphTest(unittest.TestCase):
         graph.close(edge)
         self.assertNotEqual(graph.next_edge(), edge)
 
-    def test_auth_reopens_denied_entries(self):
+    def test_auth_reopens_edges_blocked_by_missing_session(self):
         graph = AttackGraph()
         graph.add_entries([Entry("GET", "/assets", {"q": "search"}, auth="denied")])
-        # 把所有待验证边都关掉，模拟「未登录时全试过、全失败」
+        # 一个 search 参数会派生出 ssti 和 sqli 两条边，两条都要因缺会话关掉
         while True:
             edge = graph.next_edge()
             if edge is None:
                 break
-            graph.close(edge)
+            graph.close(edge, by_auth=True)
         self.assertIsNone(graph.next_edge())
         graph.add_capability("auth", "session")
         again = graph.next_edge()
         self.assertIsNotNone(again)
         self.assertEqual(again.state, "pending")
+
+    def test_auth_does_not_reopen_genuinely_failed_edges(self):
+        graph = AttackGraph()
+        graph.add_entries([Entry("GET", "/assets", {"q": "search"})])
+        while True:
+            edge = graph.next_edge()
+            if edge is None:
+                break
+            # 这个族真的试过并失败了，重开只是浪费步数
+            graph.close(edge)
+        graph.add_capability("auth", "session")
+        self.assertIsNone(graph.next_edge())
 
     def test_stats_track_progress(self):
         graph = self._graph_with_lfi_found()

