@@ -42,7 +42,7 @@ from .playbook import Candidate, detect, propose
 from .session import SessionManager, pty_available
 
 MAX_OBS_CHARS = 2600
-MAX_STEPS_HARD_CAP = 120
+MAX_STEPS_HARD_CAP = 200
 MAX_FLAGS_PER_CHALLENGE = 15
 # 同一主机两次动作之间的最小间隔 + 随机抖动。主动防御/蜜罐类靶标对节拍敏感，
 # 均匀的高频请求最容易被判定成扫描器（Cairn 把这套叫「受管出口」）。
@@ -50,6 +50,8 @@ MIN_ACTION_GAP = 0.9
 JITTER = 0.7
 # 连续撞到这么多次主动防御话术就熔断该题，避免把「死手」这类题的自毁机制踩爆。
 TRIPWIRE_BREAKER = 3
+# 连续多少步没有新事实就放弃这道题
+STALE_ABANDON = 25
 BANNER_CLIP = 700
 # 静态工具放在这里，由镜像构建期铺进 /app/vendor/bin
 TOOL_BIN_DIR = "/app/vendor/bin"
@@ -174,6 +176,23 @@ STUCK_HINTS = (
         "组件/沙箱类：确认组件版本与已知 gadget，试 yaml/jackson/fastjson/xstream 特征 payload、"
         "试模板注入 {{7*7}}、试命令拼接与路径穿越。")),
 )
+
+
+def _discover_routes(base_url: str) -> tuple[list[str], list[str], int]:
+    """抓首页与前端 JS，抽出路由和硬编码凭据。失败就返回空，不影响侦察。"""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    base = base_url.rstrip("/")
+    try:
+        with opener.open(base + "/", timeout=6) as response:
+            html = response.read(300_000).decode("utf-8", "replace")
+    except Exception:
+        return [], [], 0
+    scripts = sense.fetch_assets(base, html)
+    routes = sense.extract_routes(html, scripts)
+    secrets = sense.extract_secrets(scripts + "\n" + html)
+    emit("recon_routes", base=base, routes=len(routes),
+         secrets=len(secrets), js_chars=len(scripts))
+    return routes, secrets, len(scripts)
 
 
 def _stuck_hint(challenge: Challenge, step: int) -> str:
@@ -732,6 +751,21 @@ def recon_scan(context: SolveContext, board: FactBoard,
             board.add(Fact("service", f"base_url:{context.base_url}",
                            f"默认 Web 入口 {context.base_url}", "low"))
 
+    # 路由与凭据发现：首页 + 它引用的 JS，抽路径与硬编码 key。
+    # 这是纯确定性工作，不该花模型步数——实测模型会为同一个 app.js 反复下载六次。
+    if context.base_url.startswith("http"):
+        routes, secrets, js_len = _discover_routes(context.base_url)
+        if routes:
+            lines.append(f" 前端路由/接口 {len(routes)} 个：" + ", ".join(routes[:18]))
+            for route in routes[:18]:
+                board.add(Fact("route", f"route:{route}",
+                               f"{context.base_url.rstrip('/')}{route}", "low"))
+        if secrets:
+            lines.append(f" 前端硬编码凭据 {len(secrets)} 条：" + ", ".join(secrets[:6]))
+            for item in secrets:
+                board.add(Fact("credential", f"secret:{item}",
+                               f"前端 JS 里出现 {item}", "high"))
+
     # mDNS：动态靶标常用它公布真实端点
     if 5353 in open_ports or not open_ports:
         names = sense.mdns_services()
@@ -865,7 +899,7 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
                                   f"{int(time.time() * 1000)}.jsonl"), host=host)
     context = SolveContext(host=host, hint_ports=hint_ports, board=board)
     toolkit = Toolkit(context, shell_timeout=shell_timeout)
-    steps = max_steps or int(os.environ.get("BENCH_MAX_STEPS", "60"))
+    steps = max_steps or int(os.environ.get("BENCH_MAX_STEPS", "90"))
     steps = max(1, min(steps, MAX_STEPS_HARD_CAP))
     if deadline is None:
         deadline = time.time() + int(os.environ.get("BENCH_CHALLENGE_SECONDS", "780"))
@@ -1098,6 +1132,12 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
             context.observations.append(Observation(
                 step, "(卡住了)", {}, _stuck_hint(challenge, step),
                 time.time() - started_at))
+        # 连续 25 步一个新事实都没有，说明这条路走死了。继续烧步数只会挤占
+        # 后面题目的时间——实跑里 a-03..a-16 每题都烧满 60 步、产出为零。
+        if stale >= STALE_ABANDON:
+            emit("solve_abandon", unique_code=challenge.unique_code, step=step,
+                 stale=stale, note="长时间无新事实，提前收手留给第二轮")
+            break
 
     toolkit.sessions.close_all()
     emit("solve_done", unique_code=challenge.unique_code,

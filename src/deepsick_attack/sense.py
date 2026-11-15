@@ -15,9 +15,11 @@
 from __future__ import annotations
 
 import concurrent.futures
+import re
 import socket
 import ssl
 import struct
+import urllib.request
 import time
 
 # 常用端口。不追 nmap top1000 的全量，200 个覆盖 CTF 与常见服务足够，
@@ -335,3 +337,91 @@ def dns_query(name: str, qtype: str = "TXT", server: str | None = None) -> str:
         return "\n".join(str(item) for item in answers)
     except Exception as exc:  # noqa: BLE001 - 查询失败也是观测
         return f"查询 {name} {qtype} 失败：{type(exc).__name__}: {exc}"
+
+
+# ---------------------------------------------------------------- 路由发现
+
+_ROUTE_RE = re.compile(r"""["'`](/(?:[A-Za-z0-9_.\-]+/?){1,6})["'`]""")
+_ATTR_RE = re.compile(r"""(?:href|src|action)\s*=\s*["']([^"']{1,200})["']""", re.I)
+_JS_URL_RE = re.compile(r"""(?:url|fetch|open|ajax|post|get)\s*[:(]\s*["'`]([^"'`]{1,200})["'`]""", re.I)
+
+
+def extract_routes(html: str, scripts: str = "", limit: int = 40) -> list[str]:
+    """从首页与前端 JS 里抽路由。
+
+    这是纯确定性工作，不该花模型步数。实测 a-04「企业内容管理系统」里模型用
+    六步反复下载同一个 app.js，就是为了从里面捞出 `/api/upload.php` 和 key 的
+    用法；这一步交给代码，模型直接从清单里挑。
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def push(path: str) -> None:
+        path = (path or "").strip()
+        if not path or len(path) > 120:
+            return
+        if path.startswith("//") or path.startswith("http"):
+            return
+        if not path.startswith("/"):
+            return
+        if path.lower().endswith((".css", ".png", ".jpg", ".jpeg", ".gif",
+                                  ".svg", ".ico", ".woff", ".woff2", ".ttf")):
+            return
+        if path in seen:
+            return
+        seen.add(path)
+        found.append(path)
+
+    for m in _ATTR_RE.finditer(html or ""):
+        push(m.group(1))
+    for m in _ROUTE_RE.finditer(html or ""):
+        push(m.group(1))
+    for text in (scripts or "",):
+        for m in _JS_URL_RE.finditer(text):
+            push(m.group(1))
+        for m in _ROUTE_RE.finditer(text):
+            push(m.group(1))
+    return found[:limit]
+
+
+def fetch_assets(base_url: str, html: str, timeout: float = 5.0,
+                 max_scripts: int = 4, limit_bytes: int = 400_000) -> str:
+    """抓首页引用到的 JS，拼成一段文本。抓不到就返回空串。"""
+    base_url = (base_url or "").rstrip("/")
+    if not base_url:
+        return ""
+    chunks: list[str] = []
+    for m in re.finditer(r"""<script[^>]+src\s*=\s*["']([^"']+)["']""", html or "", re.I):
+        src = m.group(1).strip()
+        if src.startswith("//"):
+            src = "http:" + src
+        url = src if src.startswith("http") else base_url + "/" + src.lstrip("/")
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
+                raw = response.read(limit_bytes)
+            chunks.append(raw.decode("utf-8", "replace"))
+        except Exception:
+            continue
+        if len(chunks) >= max_scripts:
+            break
+    return "\n".join(chunks)
+
+
+_SECRET_RE = re.compile(
+    r"""(?i)["']?([A-Za-z0-9_\-]{0,20}(?:api[_-]?key|apikey|x-api-key|secret|token|passwd|password)[A-Za-z0-9_\-]{0,10})["']?\s*[:=]\s*["']([^"'\s]{4,64})["']""")
+
+
+def extract_secrets(text: str, limit: int = 8) -> list[str]:
+    """从前端 JS 里捞硬编码凭据。a-04 的 key 就是从前端包里挖出来的。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _SECRET_RE.finditer(text or ""):
+        name, value = m.group(1), m.group(2)
+        if value.lower() in ("null", "undefined", "true", "false"):
+            continue
+        key = f"{name}={value}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out[:limit]

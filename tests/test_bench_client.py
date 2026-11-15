@@ -181,7 +181,7 @@ class FlowTest(unittest.TestCase):
         def boom(ch, started):
             raise RuntimeError("模拟解题器崩溃")
 
-        summary = run_benchmark(boom, client=client)
+        summary = run_benchmark(boom, client=client, passes=1)
         self.assertIn(("close", "todo"), client.calls)
         self.assertEqual(summary["errors"], 1)
         self.assertEqual(summary["closed"], 1)
@@ -273,7 +273,8 @@ class ConcurrencyTest(unittest.TestCase):
             time.sleep(0.12)
             return []
 
-        summary = run_benchmark(slow_solver, client=SlowClient(), workers=3)
+        summary = run_benchmark(slow_solver, client=SlowClient(), workers=3,
+                                passes=1)
         self.assertEqual(summary["started"], 6)
         self.assertEqual(summary["closed"], 6)
         self.assertLessEqual(gauge.peak, 3, f"并发超过 3：{gauge.peak}")
@@ -284,6 +285,70 @@ class ConcurrencyTest(unittest.TestCase):
             self.assertEqual(_workers(), MAX_WORKERS)
         finally:
             os.environ.pop("BENCH_WORKERS", None)
+
+
+class SecondPassTest(unittest.TestCase):
+    """第一轮求速度、第二轮求深度：只有没解出来的题才翻打，且换一套攻击面提示。"""
+
+    def setUp(self):
+        os.environ["BENCH_IDLE_SECONDS"] = "0"
+        os.environ["BENCH_RETRY_DELAY"] = "0"
+
+    def tearDown(self):
+        os.environ.pop("BENCH_IDLE_SECONDS", None)
+        os.environ.pop("BENCH_RETRY_DELAY", None)
+
+    def _client(self, codes):
+        class Client(FakeClient):
+            def list_challenges(self):
+                self.calls.append("list")
+                return [Challenge(c, "", "easy", 1, 100, 1, 0, False, "running", [])
+                        for c in codes]
+
+        return Client()
+
+    def test_second_pass_only_retries_unsolved_with_hint(self):
+        client = self._client(["win", "lose"])
+        seen = []
+
+        def solver(ch, started):
+            seen.append((ch.unique_code, "第二轮" in (ch.description or "")))
+            return ["flag{x}"] if ch.unique_code == "win" else []
+
+        summary = run_benchmark(solver, client=client, passes=2)
+        # win 第一轮就解出来了，第二轮不该再启动它；lose 要带着提示重打一次
+        self.assertCountEqual(seen, [("win", False), ("lose", False), ("lose", True)])
+        self.assertEqual(summary["passes"], 2)
+        self.assertEqual(summary["started"], 3)
+        self.assertEqual(summary["closed"], 3)
+
+    def test_passes_env_controls_rounds(self):
+        os.environ["BENCH_RETRY_PASSES"] = "1"
+        try:
+            seen = []
+            client = self._client(["x"])
+
+            def solver(ch, started):
+                seen.append(ch.unique_code)
+                return []
+
+            summary = run_benchmark(solver, client=client)
+            self.assertEqual(seen, ["x"])
+            self.assertEqual(summary["passes"], 1)
+        finally:
+            os.environ.pop("BENCH_RETRY_PASSES", None)
+
+    def test_only_filters_to_one_challenge(self):
+        seen = []
+
+        def solver(ch, started):
+            seen.append(ch.unique_code)
+            return []
+
+        client = self._client(["a-01", "a-04", "a-11"])
+        summary = run_benchmark(solver, client=client, passes=1, only="a-04")
+        self.assertEqual(seen, ["a-04"])
+        self.assertEqual(summary["started"], 1)
 
 
 if __name__ == "__main__":

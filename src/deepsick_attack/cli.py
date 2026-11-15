@@ -62,11 +62,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--solver", choices=["auto", "llm", "stub"], default="auto",
         help="auto: 有模型凭据用真实解题器，否则退回占位器（不提交任何 Flag）")
     bench_solve.add_argument("--max-steps", type=int, default=None,
-                             help="单题最大动作步数，默认取 BENCH_MAX_STEPS 或 60")
+                             help="单题最大动作步数，默认取 BENCH_MAX_STEPS 或 90")
     bench_solve.add_argument("--total-seconds", type=int, default=None,
                              help="整轮总时间预算，默认取 BENCH_TOTAL_SECONDS 或 27000（v2 窗口 8 小时）")
     bench_solve.add_argument("--challenge-seconds", type=int, default=None,
                              help="单题时间预算，默认取 BENCH_CHALLENGE_SECONDS 或 780")
+    bench_solve.add_argument("--passes", type=int, default=None,
+                             help="跑几轮，默认取 BENCH_RETRY_PASSES 或 2；第二轮只翻打没解出来的题")
+    bench_solve.add_argument("--only", default=None, metavar="CODE",
+                             help="只跑题号前缀匹配的题（本地 Agent 模式单题调试，例如 a-04）")
 
     bench_set = sub.add_parser("bench-set", help="查看单个题集详情，无需 token")
     bench_set.add_argument("--set", required=True, metavar="SET_ID")
@@ -214,7 +218,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             solver = _select_solver(args)
             summary = run_benchmark(solver=solver,
-                                    total_seconds=args.total_seconds)
+                                    total_seconds=args.total_seconds,
+                                    passes=args.passes,
+                                    only=args.only)
             emit("bench_done", **summary)
             return 0
         except (BenchConfigError, BenchConnectionError, BenchAPIError) as exc:

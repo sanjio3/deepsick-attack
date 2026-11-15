@@ -89,7 +89,15 @@ python run.py bench-run --set bs-6c730ae2487f
 
 python -m deepsick_attack bench-solve --solver auto
 
-`--solver auto` 在有模型凭据时使用真实解题器，缺凭据则退回占位器并明确说明本轮不提交任何 Flag。可选预算参数 `--max-steps`、`--challenge-seconds`、`--total-seconds`，也可用环境变量 `BENCH_MAX_STEPS`、`BENCH_CHALLENGE_SECONDS`、`BENCH_TOTAL_SECONDS`、`BENCH_SHELL_TIMEOUT` 覆盖。
+`--solver auto` 在有模型凭据时使用真实解题器，缺凭据则退回占位器并明确说明本轮不提交任何 Flag。可选预算参数 `--max-steps`、`--challenge-seconds`、`--total-seconds`、`--passes`，也可用环境变量 `BENCH_MAX_STEPS`、`BENCH_CHALLENGE_SECONDS`、`BENCH_TOTAL_SECONDS`、`BENCH_SHELL_TIMEOUT`、`BENCH_RETRY_PASSES` 覆盖。
+
+步数是两段式的：默认单题 90 步、硬上限 200 步，连续 25 步没有新事实就提前收手，把时间让给后面的题。整轮默认跑两轮，第二轮只翻打第一轮没解出来的题，并在题面追加一段换攻击面的提示——第一轮求覆盖速度，第二轮求深度。
+
+本地 Agent 模式下平台会签发 Token 与 Base URL，接上之后可以单题重跑：
+
+BENCHMARK_BASE_URL=https://... BENCHMARK_TOKEN=... python -m deepsick_attack bench-solve --only a-04 --passes 1
+
+`--only` 按题号子串过滤，配合容器 stdout 可以直接看到这道题每一步的动作与观测。
 
 本地验证整条链路不需要真实平台：起一个模拟 Challenges API，把 `BENCHMARK_BASE_URL` 指向它、`BENCHMARK_TOKEN` 填对应值即可跑通 list → start → 解题 → submit → close。
 
