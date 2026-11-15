@@ -5,7 +5,10 @@
 2. 边由入口属性派生，不是穷举 payload 表；
 3. 拿到能力后 flag_hunt 会被派生出来并且排在最前（不再回头挖洞）。
 """
+import os
 import sys
+import tempfile
+import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -324,6 +327,34 @@ class JudgeTest(unittest.TestCase):
         edge = Edge("auth", Entry("POST", "/login.php", {"username": "generic"}))
         verdict = graph_exec.judge(edge, "admin:admin => 200 /login.php")
         self.assertEqual(verdict["state"], "failed")
+
+
+class PersistenceTest(unittest.TestCase):
+    """资产图必须落盘——artex 里它是跨进程的全局真值库，不是临时变量。"""
+
+    def test_save_load_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "asset_graph.json")
+            g = AttackGraph(path)
+            g.add_entries([Entry("GET", "/a.php", params={"id": "file"})])
+            lfi = next(e for e in g.edges.values() if e.family == "lfi")
+            g.close(lfi, by_auth=True)
+            g.add_capability("rce", "global", "演示")
+            g.add_creds(["admin:admin123"])
+
+            g2 = AttackGraph(path)
+            self.assertIn("GET:/a.php?id", g2.entries)
+            self.assertIn("lfi@GET:/a.php?id", g2.edges)
+            self.assertIn("lfi@GET:/a.php?id", g2.blocked_by_auth)
+            self.assertIn("rce@global", g2.caps)
+            self.assertEqual(g2.creds, ["admin:admin123"])
+            # 引用完整性：边必须指回同一个 entries 字典里的 Entry 对象
+            lfi2 = g2.edges["lfi@GET:/a.php?id"]
+            self.assertIs(lfi2.entry, g2.entries["GET:/a.php?id"])
+            # 登录能力在重建后的图上依然能触发重开
+            g2.add_capability("auth", "session", "会话恢复")
+            self.assertEqual(lfi2.state, "pending")
+            self.assertNotIn(lfi2.key, g2.blocked_by_auth)
 
 
 if __name__ == "__main__":

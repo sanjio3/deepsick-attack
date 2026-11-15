@@ -37,8 +37,10 @@ artex 里那套「意图-事实-发现血缘」落到这里就是一张有向图
 from __future__ import annotations
 
 import json
+import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 # ---------------------------------------------------------------- 参数类型
 
@@ -438,15 +440,74 @@ def derive(entry: Entry) -> list[Edge]:
 
 
 class AttackGraph:
-    """攻击图。所有状态集中在这里，模型只看到它的文本投影。"""
+    """攻击图。所有状态集中在这里，模型只看到它的文本投影。
 
-    def __init__(self) -> None:
+    资产图是 artex 双图里的「全局真值」：入口、待验证边、已获能力全部落盘
+    （JSON），进程重启或换 worker 不丢。
+    """
+
+    def __init__(self, path: str | Path | None = None) -> None:
+        self.path = Path(path) if path else None
         self.entries: dict[str, Entry] = {}
         self.edges: dict[str, Edge] = {}
         self.caps: dict[str, Capability] = {}
         self.closed: set[str] = set()      # 已确定失败的边，不再派发
         self.blocked_by_auth: set[str] = set()   # 因缺会话而失败的边，登录后要重开
         self.creds: list[str] = []         # 已发现的凭据，喂给 auth 边
+        if self.path is not None and self.path.exists():
+            self._load()
+
+    # ---- 持久化 ----
+
+    def _save(self) -> None:
+        if self.path is None:
+            return
+        data = {
+            "entries": [asdict(e) for e in self.entries.values()],
+            "edges": [
+                {
+                    "family": e.family,
+                    "entry_key": e.entry.key if e.entry else None,
+                    "payload_note": e.payload_note,
+                    "state": e.state,
+                    "attempts": e.attempts,
+                    "why": e.why,
+                }
+                for e in self.edges.values()
+            ],
+            "caps": [{"kind": c.kind, "via": c.via, "detail": c.detail}
+                     for c in self.caps.values()],
+            "closed": sorted(self.closed),
+            "blocked_by_auth": sorted(self.blocked_by_auth),
+            "creds": self.creds,
+        }
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    def _load(self) -> None:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        for d in data.get("entries", []):
+            entry = Entry(**d)
+            self.entries[entry.key] = entry
+        for d in data.get("edges", []):
+            edge = Edge(family=d["family"],
+                        entry=self.entries.get(d.get("entry_key") or ""),
+                        payload_note=d.get("payload_note") or "",
+                        state=d.get("state") or "pending",
+                        attempts=int(d.get("attempts") or 0),
+                        why=d.get("why") or "")
+            self.edges[edge.key] = edge
+        for d in data.get("caps", []):
+            cap = Capability(kind=d["kind"], via=d.get("via") or "",
+                             detail=d.get("detail") or "")
+            self.caps[cap.key] = cap
+        self.closed = set(data.get("closed") or [])
+        self.blocked_by_auth = set(data.get("blocked_by_auth") or [])
+        self.creds = list(data.get("creds") or [])
 
     # ---- 写入 ----
 
@@ -466,6 +527,7 @@ class AttackGraph:
         for edge in self.edges.values():
             if edge.family == "auth":
                 edge.payload_note = json.dumps(self.creds, ensure_ascii=False)
+        self._save()
 
     def add_entries(self, entries: list[Entry]) -> list[Entry]:
         """新入口入图，并为它派生出待验证边。返回真正新增的那些。"""
@@ -489,6 +551,7 @@ class AttackGraph:
             for edge in self.edges.values():
                 if edge.family == "harvest":
                     edge.attempts = 0
+            self._save()
         return fresh
 
     def add_capability(self, kind: str, via: str, detail: str = "") -> list[Edge]:
@@ -534,6 +597,7 @@ class AttackGraph:
                            why="已取得会话，收割业务页面里的表单与链接")
             self.edges.setdefault(harvest.key, harvest)
             created.append(harvest)
+        self._save()
         return created
 
     def close(self, edge: Edge, by_auth: bool = False) -> None:
@@ -542,9 +606,11 @@ class AttackGraph:
         if by_auth:
             # 因缺会话而失败的边，等拿到会话后要重开：它不代表这个漏洞族不存在。
             self.blocked_by_auth.add(edge.key)
+        self._save()
 
     def mark_worked(self, edge: Edge) -> None:
         edge.state = "worked"
+        self._save()
 
     # ---- 读取 ----
 

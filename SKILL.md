@@ -19,8 +19,9 @@ description: 智能体安全攻防挑战赛「攻击agent渗透」赛道参赛 S
 
 ## 机制落点（artex 式）
 
-1. 双图分工：`attack_graph.py` 资产图存入口与待验证边，`explore_graph.py`
-   探索图存 intent/fact/finding 血缘；flag 与封锁都带证据。
+1. 双图分工：`attack_graph.py` 资产图存入口与待验证边（落盘 asset_graph.json，
+   auto_probe 命令执行后判定与能力派生自动写回），`explore_graph.py` 探索图存
+   intent/fact/finding 血缘（落盘 graph.json）；fact/finding 带证据文件。
 2. 状态外置：`workspace.py` 每题工作区（notes/todolist/evidence），上下文
    压缩不丢事实；`agent_loop.py` 的 GC 把超长输出归档，正文在图与笔记里。
 3. 双角色同脑：worker 认领 intent 走透、planner 读图派方向，靠注入指令切换；

@@ -14,9 +14,10 @@
 每道题一条持续对话，模型在对话里用原生 tool calls 自主推进（`agent_loop.py`）。
 决策权在模型，确定性代码负责感知、判定与记账：
 
-- 双图：`attack_graph.py` 是资产图（入口/参数/边=待验证假设的真值库），
-  `explore_graph.py` 是探索图（intent → fact → finding 的血缘链，封锁方向
-  重开必须写新机理）。
+- 双图：`attack_graph.py` 是资产图（入口/参数/边=待验证假设，**落盘为
+  asset_graph.json**，worked/failed/auth 判定与能力派生自动写回）；`explore_graph.py`
+  是探索图（intent → fact → finding 血缘链，落盘 graph.json，封锁方向重开必须
+  写新机理）。两图经 entry key 锚定相连，overview 一次读全。
 - 状态外置：`workspace.py` 每题一个 /tmp/ws/<题号>/ 工作区——notes.md 黑板、
   todolist.md 规划待办（串行利用链跨轮推进）、evidence/ 证据目录。对话被
   GC 不丢事实，planner 每次规划从图上读态势。
@@ -24,8 +25,9 @@
   与 planner 纪律（读 overview、更新 todolist、派生新 intent）靠注入指令切换。
 - 战术卡：`skills/` 按漏洞族拆分（recon/lfi/sqli/auth/upload/cmdi/ssti/ssrf/
   deser/port/flag），认领 intent 时按族加载，主提示词只放纪律不放清单。
-- 证据门控：fact/finding 必须挂证据；flag 交卷记录出处；疑似即交，用平台
-  反馈当判定。
+- 证据门控：graph 的 add_fact/close_intent 接受 evidence 原文并自动落盘
+  evidence/；shell 输出命中 flag 时证据自动落盘挂到 finding 上；疑似即交，
+  用平台反馈当判定。
 - 确定性快路径保留：`graph op=auto_probe` 返回资产图上优先级最高的预渲染
   命令（shell 输出里的 flag 也会被代码直接抓取提交），但用不用由模型决定。
 - LLM：MiniMax-M3.1-Flash 走 Anthropic 兼容协议（`llm.py`），原生 tool_use /

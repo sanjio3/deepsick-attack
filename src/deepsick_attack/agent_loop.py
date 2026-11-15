@@ -19,6 +19,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import time
 from typing import Any, Callable
 
@@ -28,6 +30,13 @@ from .events import emit
 from .explore_graph import ExploreGraph
 from .flags import extract_flags
 from .workspace import Workspace
+
+# 模型自己跑出登录成功的信号：命令里有口令字段、响应里发了会话 cookie。
+_SESSION_COOKIE_RE = re.compile(
+    r"Set-Cookie:\s*(?:PHPSESSID|session|jsessionid|sessid|SESSID|connect\.sid)"
+    r"=([A-Za-z0-9_\-]{8,})", re.I)
+_LOGIN_HINT_RE = re.compile(
+    r"(?:password|passwd|pwd)\s*=|login|signin|登录|认证", re.I)
 
 MAX_TURNS_HARD = 200
 # 单个 tool_result 在对话里保留的上限；超了就归档（正文在图/笔记/证据里）
@@ -80,7 +89,7 @@ TOOLS: list[dict[str, Any]] = [
          "path": {"type": "string", "description": "相对工作区的路径，如 notes.md / todolist.md / evidence/x.txt / shell.php"},
          "content": {"type": "string"}},
          "required": ["op", "path"]}},
-    {"name": "graph", "description": "攻击图操作。op=overview 读全部态势（资产+intent+fact，planner 每次 planning 前必读）；op=add_intent 派新假设（family/target/why）；op=close_intent 收口（intent_id/status/verdict，dead 必须写依据）；op=add_fact 写事实（kind/content，例如 file_read/creds/session/rce）；op=add_entry 补资产（url 或 host:port）；op=auto_probe 取资产图上优先级最高的预渲染命令（确定性快路径，拿到直接 shell 执行）；op=skill 读某族战术卡（lfi/sqli/auth/upload/cmdi/ssti/ssrf/deser/port/flag/recon）。",
+    {"name": "graph", "description": "攻击图操作。op=overview 读全部态势（资产+intent+fact，planner 每次 planning 前必读）；op=add_intent 派新假设（family/target/why，可选 parent_fact 挂血缘）；op=close_intent 收口（intent_id/status/verdict，dead 必须写依据）；op=add_fact 写事实（kind/content，例如 file_read/creds/session/rce；evidence 传证据原文，会自动落盘并挂到这条事实——没有证据的关键事实不作数）；op=add_entry 补资产（url 或 host:port）；op=auto_probe 取资产图上优先级最高的预渲染命令（确定性快路径，请用 shell 原样执行，结果会自动判定写回图）；op=skill 读某族战术卡（lfi/sqli/auth/upload/cmdi/ssti/ssrf/deser/port/flag/recon）。",
      "input_schema": {"type": "object", "properties": {
          "op": {"type": "string", "enum": ["overview", "add_intent", "close_intent",
                                            "add_fact", "add_entry", "auto_probe", "skill"]},
@@ -89,6 +98,8 @@ TOOLS: list[dict[str, Any]] = [
          "status": {"type": "string", "enum": ["done", "dead", "blocked", "pending"]},
          "verdict": {"type": "string"}, "kind": {"type": "string"},
          "content": {"type": "string"}, "url": {"type": "string"},
+         "evidence": {"type": "string", "description": "证据原文（自动落盘到 evidence/ 并挂到记录上）"},
+         "parent_fact": {"type": "string", "description": "派生自哪条 fact id（如 f3），建立血缘"},
          "skill": {"type": "string"}},
          "required": ["op"]}},
     {"name": "submit_flag", "description": "交卷。拿到疑似 flag 立刻提交（不要等攒齐），平台会反馈 correct 与进度。",
@@ -154,6 +165,9 @@ class AgentRunner:
         self.correct_flags = 0
         self.stale_turns = 0
         self.last_role = "worker"
+        # auto_probe 渲染出来、等模型用 shell 原样执行的命令。
+        # 执行后 judge 的结果自动写回资产图（worked/failed/auth + 能力派生）。
+        self._pending_probe: tuple[Any, str] | None = None
 
     # ---- 主循环 ----
     def run(self) -> dict:
@@ -303,15 +317,75 @@ class AgentRunner:
         if not command:
             return "command 为空"
         output = self.toolkit.run("shell", {"command": command})
-        # 确定性副驾驶照旧：flag 直交、入口入图（模型看不见这两步的内部）
+        # auto_probe 的预渲染命令被（近似）原样执行 → 判定自动写回资产图。
+        # 模型自由跑别的命令不受影响；匹配放宽到前 100 字符，容忍它加引号。
+        verdict_note = ""
+        if self._pending_probe is not None:
+            edge, rendered = self._pending_probe
+            if (command.strip().startswith(rendered.strip()[:100])
+                    or rendered.strip().startswith(command.strip()[:100])):
+                verdict_note = self._record_edge(edge, output)
+                self._pending_probe = None
+        # 登录成功检测：会话拿到了 → 资产图重开因缺会话封锁的边 + 探索图重开
+        # blocked intent。这是 artex「auth 不等于不存在」链路的另一半。
+        if self._auth_success(command, output):
+            self.asset.add_capability("auth", "session", "检测到会话 cookie")
+            reopened = self.explore.reopen_by_auth()
+            self.explore.add_fact("session", "登录成功（检测到会话 cookie）",
+                                  step=self.start_step + self.turns)
+            emit("agent_session_ok", unique_code=self.challenge.unique_code,
+                 turns=self.turns, reopened_intents=reopened,
+                 reopened_edges=True)
+        # 确定性副驾驶照旧：flag 直交（并自动落证据）、入口入图
         for flag in extract_flags(output):
+            evidence = self.ws.save_evidence(
+                f"flag-{self.start_step + self.turns}", output)
             self._submit_one(flag, self.start_step + self.turns,
-                             f"shell 自动提取 {command[:60]}")
+                             f"shell 自动提取 {command[:60]}", evidence=evidence)
         fresh = self.asset.add_entries(extract_entries(output))
         if fresh:
             emit("agent_graph_seed", unique_code=self.challenge.unique_code,
                  new_entries=len(fresh))
+        if verdict_note:
+            output = f"{output}\n\n[图判定] {verdict_note}"
         return output
+
+    def _record_edge(self, edge, output: str) -> str:
+        """把 auto_probe 边的真实执行结果判定后写回资产图。
+
+        worked → mark_worked；auth_required → 封锁待重开；failed → 关闭；
+        判出的能力（file_read/rce/...）触发 add_capability 派生 flag_hunt 等后续边。
+        """
+        verdict = graph_exec.judge(edge, output)
+        edge.attempts += 1
+        state = verdict.get("state") or "failed"
+        if state == "worked":
+            self.asset.mark_worked(edge)
+        elif state == "auth_required":
+            if edge.entry is not None:
+                edge.entry.auth = "denied"
+            self.asset.close(edge, by_auth=True)
+        else:
+            self.asset.close(edge)
+        for kind, via, detail in (verdict.get("caps") or []):
+            self.asset.add_capability(kind, via, detail)
+        note = verdict.get("note") or ""
+        where = edge.entry.key if edge.entry else "global"
+        caps_txt = ""
+        if verdict.get("caps"):
+            caps_txt = "，新能力已上图：" + ",".join(
+                k for k, _, _ in verdict["caps"])
+        return (f"{edge.family} @ {where} → {state}"
+                + (f"，{note}" if note else "") + caps_txt)
+
+    @staticmethod
+    def _auth_success(command: str, output: str) -> bool:
+        if not _LOGIN_HINT_RE.search(command or ""):
+            return False
+        if _SESSION_COOKIE_RE.search(output or ""):
+            return True
+        return bool(re.search(r"(登录成功|LOGIN_OK|login success|authenticated)",
+                              output or "", re.I))
 
     def _do_session(self, args: dict) -> str:
         op = str(args.get("op") or "list").lower()
@@ -346,25 +420,37 @@ class AgentRunner:
         if op == "add_intent":
             intent = self.explore.add_intent(
                 str(args.get("family") or "web"), str(args.get("target") or ""),
-                str(args.get("why") or ""), step=self.start_step + self.turns)
-            return f"intent #{intent.id} [{intent.family}] {intent.target} 已入图"
+                str(args.get("why") or ""),
+                parent_fact=str(args.get("parent_fact") or ""),
+                step=self.start_step + self.turns)
+            return (f"intent #{intent.id} [{intent.family}] {intent.target} 已入图"
+                    + (f"（血缘：{intent.parent_fact}）" if intent.parent_fact else ""))
         if op == "close_intent":
+            evidence = self._save_evidence_arg(args.get("evidence"),
+                                               f"close-{args.get('intent_id')}")
             intent = self.explore.close(
                 int(args.get("intent_id") or 0),
                 str(args.get("status") or "dead"),
-                str(args.get("verdict") or ""), step=self.start_step + self.turns)
+                str(args.get("verdict") or ""),
+                evidence=[evidence] if evidence else None,
+                step=self.start_step + self.turns)
             if intent is None:
                 return "intent_id 不存在或状态非法"
-            return f"intent #{intent.id} → {intent.status}"
+            return (f"intent #{intent.id} → {intent.status}"
+                    + (f"，证据已挂 {evidence}" if evidence else "（无证据）"))
         if op == "add_fact":
             kind = str(args.get("kind") or "note")
             content = str(args.get("content") or "")
+            evidence = self._save_evidence_arg(args.get("evidence"), f"fact-{kind}")
             fact = self.explore.add_fact(kind, content,
-                                         step=self.start_step + self.turns)
+                                         step=self.start_step + self.turns,
+                                         evidence=evidence)
             # 凭据类事实直接喂给资产图的登录尝试表
             if kind == "creds":
                 self.asset.add_creds([content])
-            return f"fact {fact.id} 已记录"
+            return (f"fact {fact.id} 已记录"
+                    + (f"，证据 {os.path.basename(evidence)}" if evidence
+                       else "（无证据；关键结论必须补证据）"))
         if op == "add_entry":
             url = str(args.get("url") or "")
             entries = extract_entries(f"link: {url}") if url else []
@@ -388,8 +474,11 @@ class AgentRunner:
             if rendered is None:
                 self.asset.close(edge)
                 continue
-            self.asset.close(edge)  # 预渲染的边执行权交给模型，标记已处理
-            return f"auto_probe 预渲染命令（edge={edge.key}，可直接 shell 执行）：\n{rendered}"
+            # 边保留 pending：等模型用 shell 原样执行后由 _record_edge 判定写回。
+            # 提前 close 会丢掉 worked/failed/auth 的记账，能力派生链也就断了。
+            self._pending_probe = (edge, rendered)
+            return (f"auto_probe 预渲染命令（edge={edge.key}）。请用 shell "
+                    f"原样执行它，结果会自动判定写回资产图：\n{rendered}")
         return "资产图上没有可渲染的边"
 
     def _read_skill(self, family: str) -> str:
@@ -410,7 +499,15 @@ class AgentRunner:
             lines.append(f"{flag[:60]} → {'correct' if correct else 'rejected'}")
         return "; ".join(lines)
 
-    def _submit_one(self, flag: str, step: int, source: str) -> bool:
+    def _save_evidence_arg(self, value: Any, tag: str) -> str:
+        """evidence 字符串 → evidence/ 下的文件，返回挂到记录上的路径。"""
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        return self.ws.save_evidence(tag, text)
+
+    def _submit_one(self, flag: str, step: int, source: str,
+                    evidence: str = "") -> bool:
         key = flag.lower()
         if key in self.submitted:
             return self.submitted[key]
@@ -418,9 +515,11 @@ class AgentRunner:
         self.submitted[key] = correct
         if correct:
             self.correct_flags += 1
-            self.explore.add_finding(f"flag 提交成功（{source[:60]}）", flag=flag)
+            self.explore.add_finding(f"flag 提交成功（{source[:60]}）",
+                                     evidence=evidence, flag=flag)
         else:
-            self.explore.add_finding(f"flag 被平台拒绝：{flag[:60]}")
+            self.explore.add_finding(f"flag 被平台拒绝：{flag[:60]}",
+                                     evidence=evidence)
         return correct
 
     # ---- 杂项 ----

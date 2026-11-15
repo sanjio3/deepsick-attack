@@ -20,8 +20,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import patch
 
 from deepsick_attack import sense
+from deepsick_attack.agent_loop import AgentRunner
+from deepsick_attack.attack_graph import AttackGraph, Entry
 from deepsick_attack.bench_client import Challenge, StartResult, _accepts_submit
 from deepsick_attack.events import set_sink
+from deepsick_attack.explore_graph import ExploreGraph
 from deepsick_attack.facts import Fact, FactBoard
 from deepsick_attack.flags import extract_flags
 from deepsick_attack.playbook import Candidate, detect, propose
@@ -35,6 +38,7 @@ from deepsick_attack.solver import (
     recon_scan,
     solve_challenge,
 )
+from deepsick_attack.workspace import Workspace
 
 FLAG = "flag{st4ge_one_d3mo}"
 
@@ -731,6 +735,209 @@ class LoopMechanicsTest(unittest.TestCase):
         self.assertTrue(big)
         self.assertTrue(any("已归档" in str(b.get("content", "")) for b in big),
                          "超长输出没有被 GC 归档")
+
+
+class _LfiHandler(BaseHTTPRequestHandler):
+    """双图链路测试靶标：/download.php?id=…（LFI 判据 root:x:0:0 / flag）。"""
+
+    def do_GET(self):
+        from urllib.parse import parse_qs, urlparse
+        parsed = urlparse(self.path)
+        if parsed.path == "/download.php":
+            fid = (parse_qs(parsed.query).get("id") or [""])[0]
+            if "flag" in fid.lower():
+                body = "flag{lfi_probe_case}"
+            elif ".." in fid or "passwd" in fid:
+                body = "root:x:0:0:root:/root:/bin/bash"
+            else:
+                body = "not found"
+        elif parsed.path == "/login.php":
+            body = ('<form action="/login.php" method="POST">'
+                    '<input name="username"><input type="password" name="password">'
+                    '</form>')
+        else:
+            body = "404"
+        payload = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args):
+        pass
+
+
+class _AuthHandler(BaseHTTPRequestHandler):
+    """登录成功发 12 位会话 cookie；业务页没会话时 302 到登录页。"""
+
+    def do_GET(self):
+        from urllib.parse import urlparse
+        if urlparse(self.path).path == "/secret.php":
+            if "PHPSESSID=sessionsessio" in (self.headers.get("Cookie") or ""):
+                body = "<html>ok</html>"
+                code = 200
+            else:
+                self.send_response(302)
+                self.send_header("Location", "/login.php")
+                self.end_headers()
+                return
+        elif urlparse(self.path).path == "/login.php":
+            body = "<html>login</html>"
+            code = 200
+        else:
+            body = "404"
+            code = 404
+        payload = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_POST(self):
+        from urllib.parse import urlparse
+        if urlparse(self.path).path != "/login.php":
+            self.send_response(404)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(length)
+        self.send_response(302)
+        self.send_header("Location", "/secret.php")
+        self.send_header("Set-Cookie", "PHPSESSID=sessionsessio; path=/")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+class _HttpServer:
+    def __init__(self, handler):
+        self.httpd = HTTPServer(("127.0.0.1", 0), handler)
+        self.port = self.httpd.server_address[1]
+
+    def __enter__(self):
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        return False
+
+
+class _DynamicClient:
+    """按轮次动态构造 tool_use 的假 client（第 2 轮需要读 runner 的 pending）。"""
+
+    def __init__(self, plan):
+        self.plan = plan          # callable(turn_no, runner) -> [(name, input)]
+        self.box = [None]         # _make_runner 会把 runner 塞进来
+        self.calls = 0
+        self.hist = []
+
+    def chat(self, system, messages, tools=None, **kwargs):
+        self.calls += 1
+        self.hist.append(json.loads(json.dumps(messages)))
+        batch = self.plan(self.calls, self.box[0])
+        blocks = []
+        for i, (name, inp) in enumerate(batch):
+            blocks.append({"type": "text", "text": f"{i}:{name}"})
+            blocks.append({"type": "tool_use", "id": f"c{self.calls}-{i}",
+                           "name": name, "input": inp})
+        return {"content": blocks, "stop_reason": "tool_use"}
+
+
+def _make_runner(client, *, base_url, asset=None, explore=None, ws=None,
+                 on_flag=None):
+    box = getattr(client, "box", None)
+    context = SolveContext(host="127.0.0.1", hint_ports=[])
+    runner = AgentRunner(
+        make_challenge(), client, Toolkit(context),
+        workspace=ws or Workspace(tempfile.mkdtemp()),
+        asset_graph=asset or AttackGraph(),
+        explore=explore or ExploreGraph(tempfile.mktemp(suffix=".json")),
+        base_url=base_url, max_turns=5,
+        deadline=time.time() + 90,
+        on_flag=on_flag or (lambda flag, step, source: True))
+    if box is not None:
+        box[0] = runner
+    return runner
+
+
+class DualGraphWiringTest(unittest.TestCase):
+    """双图必须真联动：判定写回资产图、血缘带 parent_fact、证据落盘。"""
+
+    def setUp(self):
+        self.events = []
+        set_sink(self.events.append)
+
+    def tearDown(self):
+        set_sink(None)
+
+    def test_auto_probe_judge_writes_back(self):
+        """auto_probe 命令被原样执行后，worked/能力派生自动写回资产图。"""
+        with _HttpServer(_LfiHandler) as srv:
+            asset = AttackGraph()
+            asset.add_entries([Entry("GET", "/download.php", params={"id": "file"})])
+            client = _DynamicClient(lambda turn, runner: (
+                [("graph", {"op": "auto_probe"})]
+                if turn == 1 else
+                ([("shell", {"command": runner._pending_probe[1]})]
+                 if turn == 2 and runner._pending_probe else
+                 [("finish", {"summary": "done"})])))
+            runner = _make_runner(client, base_url=f"http://127.0.0.1:{srv.port}",
+                                  asset=asset)
+            runner.run()
+        self.assertTrue(asset.has_cap("file_read"),
+                        "LFI 判定成功但 file_read 能力没有上图")
+        self.assertTrue(any(e.family == "flag_hunt" for e in asset.edges.values()),
+                        "拿到 file_read 后没有派生 flag_hunt 边")
+        # flag 命中后循环直接收尾，判定写回在 runner 的最终消息里核对
+        last_content = runner.messages[-1]["content"]
+        text = json.dumps(last_content, ensure_ascii=False)
+        self.assertIn("图判定", text)
+        self.assertIn("file_read", text)
+
+    def test_fact_with_evidence_is_persisted(self):
+        """add_fact 带 evidence → 自动落盘 evidence/，路径挂到 fact 上。"""
+        ws = Workspace(tempfile.mkdtemp())
+        explore = ExploreGraph(tempfile.mktemp(suffix=".json"))
+        client = _DynamicClient(lambda turn, runner: (
+            [("graph", {"op": "add_fact", "kind": "creds",
+                        "content": "admin:admin123（/login 表单注释里发现）",
+                        "evidence": "<!-- db user: admin / admin123 -->"})]
+            if turn == 1 else [("finish", {"summary": "done"})]))
+        _make_runner(client, base_url="", explore=explore, ws=ws).run()
+        fact = explore.facts[0]
+        self.assertTrue(fact.evidence, "fact 没有挂证据路径")
+        self.assertTrue(Path(fact.evidence).exists(), "证据文件没有落盘")
+        self.assertIn("admin123", Path(fact.evidence).read_text(encoding="utf-8"))
+
+    def test_auth_success_reopens_both_graphs(self):
+        """登录成功：资产图重开 blocked_by_auth 边，探索图重开 blocked intent。"""
+        with _HttpServer(_AuthHandler) as srv:
+            asset = AttackGraph()
+            asset.add_entries([Entry("GET", "/secret.php", params={"id": "file"})])
+            lfi = next(e for e in asset.edges.values() if e.family == "lfi")
+            asset.close(lfi, by_auth=True)
+            explore = ExploreGraph(tempfile.mktemp(suffix=".json"))
+            intent = explore.add_intent("lfi", "GET:/secret.php?id=file", "打 LFI")
+            explore.close(intent.id, "blocked", "缺会话")
+            client = _DynamicClient(lambda turn, runner: (
+                [("shell", {"command": (
+                    f"curl -sS -i -m 6 -d 'username=a&password=b' "
+                    f"http://127.0.0.1:{srv.port}/login.php")})]
+                if turn == 1 else [("finish", {"summary": "done"})]))
+            _make_runner(client, base_url=f"http://127.0.0.1:{srv.port}",
+                         asset=asset, explore=explore).run()
+        self.assertTrue(asset.has_cap("auth"), "登录成功但 auth 能力没上图")
+        self.assertEqual(lfi.state, "pending", "资产图上因 auth 封锁的边没有重开")
+        self.assertEqual(explore.intents[0].status, "pending",
+                         "探索图上 blocked 的 intent 没有重开")
+        self.assertTrue([e for e in self.events
+                         if e["event"] == "agent_session_ok"])
 
 
 if __name__ == "__main__":

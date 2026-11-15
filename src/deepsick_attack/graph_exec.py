@@ -263,13 +263,46 @@ def judge(edge: Edge, output: str) -> dict:
     """从真实输出判定这条边的结果。
 
     返回 {state, flags, caps, note}：
-      state: worked / failed / inconclusive
+      state: worked / failed / inconclusive / auth_required
       caps:  应该新加到图上的能力 [(kind, via, detail)]
+
+    能力先算、flag 后判：快打直接命中 flag 时也不能丢能力记账，否则
+    「拿到 file_read → 派 flag_hunt」这条链会在 flag 命中的路径上断掉
+    （旧实现 caps 永远空，就是这个原因）。
     """
     body = output or ""
     flags = FLAG_RE.findall(body)
     caps: list[tuple[str, str, str]] = []
-    note = ""
+    fam = edge.family
+    via = edge.entry.key if edge.entry else "global"
+    proof_worked = False
+
+    if fam == "lfi" and LFI_PROOF.search(body):
+        proof_worked = True
+        caps.append(("file_read", via,
+                     f"{edge.entry.path if edge.entry else ''} 可读任意文件"))
+    elif fam == "cmd_inject" and re.search(
+            r"uid=\d+\([\w.-]+\)|www-data|root:x:0:0:", body):
+        proof_worked = True
+        caps.append(("rce", via, "参数可注入 shell 命令"))
+    elif fam == "sqli" and SQLI_ERROR.search(body):
+        proof_worked = True
+        caps.append(("db_error", via, "SQL 报错泄露"))
+    elif fam == "auth" and "LOGIN_OK" in body:
+        proof_worked = True
+        caps.append(("auth", "session", body.split("LOGIN_OK", 1)[1].strip()[:60]))
+    elif fam == "ssti" and SSTI_PROOF.search(body):
+        proof_worked = True
+    elif fam == "open_redirect" and re.search(r"30[127]\s+http://example\.com",
+                                              body):
+        proof_worked = True
+
+    # flag 命中本身就是这族可达的证明：补上族对应的能力，不让链断
+    if flags and fam == "lfi" and not caps:
+        caps.append(("file_read", via,
+                     f"{edge.entry.path if edge.entry else ''} 可读任意文件"))
+    elif flags and fam == "cmd_inject" and not caps:
+        caps.append(("rce", via, "参数可注入 shell 命令"))
 
     if flags:
         return {"state": "worked", "flags": flags, "caps": caps,
@@ -278,58 +311,31 @@ def judge(edge: Edge, output: str) -> dict:
     # 整族都被 302 到登录页：这不是「这个漏洞族不存在」，而是「还没权限」。
     # 两者必须分开，否则登录成功后的重开机制就失效了——a-05 的 download.php
     # 在未登录时正是 302，如果判成 failed，拿到会话后这条边也不会再被派发。
-    if edge.family != "auth" and re.search(r"30[127]\s+\S*login", body, re.I):
+    if fam != "auth" and re.search(r"30[127]\s+\S*login", body, re.I):
         return {"state": "auth_required", "flags": flags, "caps": caps,
                 "note": "需要登录才能打；登录成功后这条边会重新派发"}
 
-    if edge.family == "lfi":
-        if LFI_PROOF.search(body):
-            caps.append(("file_read", edge.entry.key if edge.entry else "global",
-                         f"{edge.entry.path if edge.entry else ''} 可读任意文件"))
-            note = "确认任意文件读取（读到 /etc/passwd）"
-            return {"state": "worked", "flags": flags, "caps": caps, "note": note}
-        return {"state": "failed", "flags": flags, "caps": caps,
-                "note": "路径穿越无回显"}
+    if proof_worked:
+        note = {
+            "lfi": "确认任意文件读取（读到 /etc/passwd）",
+            "ssti": "模板表达式被求值（7*7=49）",
+            "sqli": "确认 SQL 注入（有报错）",
+            "auth": "登录成功，会话已写入 " + SESSION_FILE,
+            "cmd_inject": "确认命令注入（命令执行结果回显）",
+            "open_redirect": "跳转参数未校验",
+        }.get(fam, "")
+        return {"state": "worked", "flags": flags, "caps": caps, "note": note}
 
-    if edge.family == "ssti":
-        if SSTI_PROOF.search(body):
-            return {"state": "worked", "flags": flags, "caps": caps,
-                    "note": "模板表达式被求值（7*7=49）"}
-        return {"state": "failed", "flags": flags, "caps": caps, "note": "未见求值结果"}
-
-    if edge.family == "sqli":
-        if SQLI_ERROR.search(body):
-            caps.append(("db_error", edge.entry.key if edge.entry else "global",
-                         "SQL 报错泄露"))
-            return {"state": "worked", "flags": flags, "caps": caps,
-                    "note": "确认 SQL 注入（有报错）"}
-        return {"state": "failed", "flags": flags, "caps": caps, "note": "无报错特征"}
-
-    if edge.family == "auth":
-        if "LOGIN_OK" in body:
-            caps.append(("auth", "session", body.split("LOGIN_OK", 1)[1].strip()[:60]))
-            return {"state": "worked", "flags": flags, "caps": caps,
-                    "note": "登录成功，会话已写入 " + SESSION_FILE}
-        return {"state": "failed", "flags": flags, "caps": caps, "note": "常见凭据均未登录成功"}
-
-    if edge.family == "cmd_inject":
-        if re.search(r"uid=\d+\([\w.-]+\)|www-data|root:x:0:0:", body):
-            caps.append(("rce", edge.entry.key if edge.entry else "global",
-                         "参数可注入 shell 命令"))
-            return {"state": "worked", "flags": flags, "caps": caps,
-                    "note": "确认命令注入（命令执行结果回显）"}
-        return {"state": "failed", "flags": flags, "caps": caps,
-                "note": "未见命令执行回显"}
-
-    if edge.family == "open_redirect":
-        match = re.search(r"30[127]\s+http://example\.com", body)
-        if match:
-            return {"state": "worked", "flags": flags, "caps": caps,
-                    "note": "跳转参数未校验"}
-        return {"state": "failed", "flags": flags, "caps": caps, "note": "未见外部跳转"}
-
-    if edge.family == "flag_hunt":
+    failed_note = {
+        "lfi": "路径穿越无回显",
+        "ssti": "未见求值结果",
+        "sqli": "无报错特征",
+        "auth": "常见凭据均未登录成功",
+        "cmd_inject": "未见命令执行回显",
+        "open_redirect": "未见外部跳转",
+    }
+    if fam == "flag_hunt":
         return {"state": "failed" if body.strip() else "inconclusive",
                 "flags": flags, "caps": caps, "note": "未读到 flag"}
-
-    return {"state": "inconclusive", "flags": flags, "caps": caps, "note": ""}
+    return {"state": "failed", "flags": flags, "caps": caps,
+            "note": failed_note.get(fam, "")}

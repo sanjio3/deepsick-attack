@@ -1203,10 +1203,15 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
                       f"{getattr(result, 'total_flag_count', '?')}")
         return correct
 
+    # ---- 工作区先行：双图都落盘在 /tmp/ws/<题号>/ 下（artex 的「真值库」）----
+    ws_root = os.path.join("/tmp", "ws",
+                           f"{challenge.unique_code}-{int(time.time() * 1000)}")
+    workspace = Workspace(ws_root)
+
     # ---- 阶段一：代码侦察（不经过模型）----
     # 图必须在侦察之前建好：侦察阶段就会抓到首页和前端 JS，里面的接口和参数名
     # 是后面所有假设的原料。侦察结果同时喂资产图（entry/边）和工作区笔记。
-    graph = AttackGraph()
+    graph = AttackGraph(os.path.join(ws_root, "asset_graph.json"))
     context.graph = graph
     recon_text = recon_scan(context, board)
     for flag in extract_flags(recon_text):
@@ -1234,10 +1239,7 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
             emit("solve_hint", unique_code=challenge.unique_code, hint=text[:300],
                  step=0)
 
-    # ---- 工作区与探索图（状态外置：notes / todolist / graph 全落盘）----
-    ws_root = os.path.join("/tmp", "ws",
-                           f"{challenge.unique_code}-{int(time.time() * 1000)}")
-    workspace = Workspace(ws_root)
+    # ---- 探索图（血缘链；与资产图同目录落盘）----
     explore = ExploreGraph(os.path.join(ws_root, "graph.json"))
 
     # 官方提示直指漏洞类型与命中位置，优先派 intent。
