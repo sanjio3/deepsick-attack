@@ -39,6 +39,12 @@ COMMON_CREDS = (
     "guest:guest",
 )
 
+# 登录成功后主动收割这些页面：表单参数名是派边的原料
+HARVEST_PATHS = ("/", "/dashboard.php", "/dashboard", "/index.php", "/home",
+                 "/profile.php", "/assets", "/reports", "/admin",
+                 "/dash.php", "/dash", "/report.php", "/main.php", "/list.php",
+                 "/api.php")
+
 FLAG_RE = re.compile(r"flag\{[0-9a-zA-Z_\-]{6,}\}", re.I)
 LFI_PROOF = re.compile(r"root:x:0:0:")
 SQLI_ERROR = re.compile(
@@ -197,6 +203,19 @@ def render(edge: Edge, base_url: str) -> str | None:
             calls.append(f"printf '### %s %s\\n' \"$p\" {_q(data)}; {call}; echo; "
                          f"grep -aoE 'flag\\{{[^}}]+\\}}' {SCRATCH}")
         return f"for p in {payloads}; do " + " ; ".join(calls) + " ; done"
+
+    if edge.family == "harvest":
+        # 把业务页面里的表单与链接原样抓出来。只取结构不取全文：一条命令拿
+        # 到所有入口的参数名，比模型逐页 grep 快一个数量级。
+        # 目标优先用图里已知的页面路径，再加常见页面兜底。
+        extra = [p for p in (edge.payload_note or "").split() if p.startswith("/")]
+        paths = list(dict.fromkeys(list(HARVEST_PATHS) + extra))
+        arr = " ".join(_q(p) for p in paths)
+        return (f"BASE={_q(base_url.rstrip('/'))} ; for u in {arr}; do "
+                f"printf '=== %s\\n' \"$u\"; "
+                f"curl -sS -b {SESSION_FILE} -m 8 \"$BASE$u\" "
+                f"| grep -oE '<form[^>]*>|</form>|<input[^>]*>|href=\"[^\"]+\"' "
+                f"| head -40; done")
 
     if edge.family == "recon":
         # 一次打完一整批敏感路径；命中的路径把正文一并打出来，图据此长出新入口。

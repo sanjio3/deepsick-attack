@@ -465,7 +465,14 @@ class Toolkit:
         text = text if isinstance(text, str) else str(text)
         if len(text) <= limit:
             return text
-        return text[:limit] + f"\n...[截断，共 {len(text)} 字符]"
+        # 头尾都留：Web 响应里真正有用的东西（表单、链接、flag）常在头尾，
+        # 中间是几万字符的 CSS/JS 噪音。只留头部会把末尾的 <form> 切掉，
+        # 图就抽不到参数名——a-09 的导出表单正是被这样丢掉的。
+        head = int(limit * 0.6)
+        tail = limit - head
+        return (text[:head]
+                + f"\n...[中间省略 {len(text) - limit} 字符]...\n"
+                + text[-tail:])
 
     # -- HTTP ------------------------------------------------------
 
@@ -1296,6 +1303,9 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
             # 输出里新出现的链接/表单立刻入图，这是图能自举的关键：
             # 一条 curl 拿到的页面，下一步就变成若干条待验证边。
             fresh_entries = graph.add_entries(extract_entries(output))
+            if edge.family == "recon" and not fresh_entries:
+                # 侦察空转没有价值，两次就该收手，把步数让回给模型
+                recon_rounds += 1
 
             where = edge.entry.key if edge.entry else "global"
             context.observations.append(Observation(

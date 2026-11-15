@@ -450,6 +450,12 @@ class AttackGraph:
             fresh.append(entry)
             for edge in derive(entry):
                 self.edges.setdefault(edge.key, edge)
+        if fresh:
+            # 图长出新入口就重新激活收割：模型可能刚访问了一个此前没抓过的页面，
+            # 那里可能有新的表单（a-09 的导出表单就是这样晚一步才出现）。
+            for edge in self.edges.values():
+                if edge.family == "harvest":
+                    edge.attempts = 0
         return fresh
 
     def add_capability(self, kind: str, via: str, detail: str = "") -> list[Edge]:
@@ -482,6 +488,21 @@ class AttackGraph:
                 self.blocked_by_auth.discard(edge.key)
             for entry in self.entries.values():
                 entry.auth = "ok"
+            # 有会话之后，主动把业务页面「收割」一遍：页面里的表单参数名是派边
+            # 的原料。模型自己 curl 常常只 grep 关键词，结构就丢了；这条边专门
+            # 把表单和链接原样抓出来。
+            #
+            # 收割目标优先用图里已知的页面路径（不带 query 的那些），再加一份
+            # 常见页面兜底。API 路径（带 ?action= 或 /api/ 前缀）不收割——它们
+            # 返回 JSON，没有表单可拿。
+            page_paths = sorted({e.path for e in self.entries.values()
+                                 if not e.relative and "?" not in e.path
+                                 and not e.path.startswith("/api")})
+            harvest = Edge("harvest", None,
+                           payload_note=" ".join(page_paths),
+                           why="已取得会话，收割业务页面里的表单与链接")
+            self.edges.setdefault(harvest.key, harvest)
+            created.append(harvest)
         return created
 
     def close(self, edge: Edge, by_auth: bool = False) -> None:
@@ -498,7 +519,10 @@ class AttackGraph:
 
     def pending(self) -> list[Edge]:
         out = [e for e in self.edges.values()
-               if e.state == "pending" and e.key not in self.closed]
+               if e.state == "pending" and e.key not in self.closed
+               # 收割是「持续动作」：随图增长重跑，但同一批页面反复抓没意义，
+               # 最多来三次。
+               and not (e.family == "harvest" and e.attempts >= 3)]
         # flag_hunt 永远最高：已经能读文件/执行命令了，继续挖洞是纯浪费。
         # recon 永远最低：具体边都打不动了才回到侦察摸新面。
         def _rank(edge: Edge) -> int:

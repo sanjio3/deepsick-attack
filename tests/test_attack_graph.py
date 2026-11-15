@@ -222,14 +222,19 @@ class GraphTest(unittest.TestCase):
     def test_auth_does_not_reopen_genuinely_failed_edges(self):
         graph = AttackGraph()
         graph.add_entries([Entry("GET", "/assets", {"q": "search"})])
+        failed_keys = set()
         while True:
             edge = graph.next_edge()
             if edge is None:
                 break
+            failed_keys.add(edge.key)
             # 这个族真的试过并失败了，重开只是浪费步数
             graph.close(edge)
         graph.add_capability("auth", "session")
-        self.assertIsNone(graph.next_edge())
+        # 注意不能断言「图空了」：拿到会话后本来就会新建 harvest 边去收割页面。
+        # 要断言的是「原本失败的那些边一条都没被重开」。
+        reopened = [e for e in graph.pending() if e.key in failed_keys]
+        self.assertEqual(reopened, [])
 
     def test_stats_track_progress(self):
         graph = self._graph_with_lfi_found()
