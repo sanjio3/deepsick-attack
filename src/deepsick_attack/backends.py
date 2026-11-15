@@ -2,10 +2,15 @@
 
 赛场接入时只替换这里的两个类，主循环与判定器不需要改。
 OfflineLLM / OfflineExecutor 仅用于离线自检，不发起任何网络请求。
+MiniMaxLLM 是真实模型后端，模型只提议动作，代码负责把关。
 """
 from __future__ import annotations
 
+import json
+import re
+
 from .config import PROMPT_DIR
+from .events import emit
 from .models import Hint, Intent
 from .stage_runner import StageRunner
 
@@ -31,6 +36,50 @@ class LLMClient:
 
 class OfflineLLM(LLMClient):
     def propose_action(self, stage: dict, template: str, state: dict) -> str:
+        return template
+
+
+class MiniMaxLLM(LLMClient):
+    """真实模型后端：模型提议，代码把关。
+
+    输出的 action 必须落在当前阶段允许集合内，否则回退到官方标准动作。
+    这样即使模型幻觉或试图跳步，也不会破坏 official_path 的路径匹配度。
+    """
+
+    def __init__(self, config=None):
+        super().__init__()
+        from .llm import MiniMaxClient
+        self.client = MiniMaxClient(config) if config else MiniMaxClient()
+
+    def propose_action(self, stage: dict, template: str, state: dict) -> str:
+        allowed = [stage["action"]] + list(stage.get("fallbacks", []))
+        user = json.dumps({
+            "stage": stage["id"],
+            "label": stage["label"],
+            "standard_action": template,
+            "allowed_actions": allowed,
+            "exit_criteria": stage["exit_criteria"],
+            "recent_trace": [
+                {"stage": item["stage"], "action": item["action"]}
+                for item in state["trace"][-5:]
+            ],
+            "instruction": "只输出一个 JSON 对象，键为 action，值必须取自 allowed_actions。",
+        }, ensure_ascii=False)
+        try:
+            reply = self.client.complete(
+                system=self.planner_prompt, user=user,
+                max_tokens=1024, effort="low",
+            )
+            match = re.search(r"\{[^{}]*\}", reply["text"])
+            if match:
+                action = json.loads(match.group(0)).get("action")
+                if action in allowed:
+                    return action
+            emit("llm_fallback", stage=stage["id"],
+                 reason="模型输出不在允许集合内，回退标准动作")
+        except Exception as exc:
+            emit("llm_fallback", stage=stage["id"],
+                 reason=f"{type(exc).__name__}，回退标准动作")
         return template
 
 

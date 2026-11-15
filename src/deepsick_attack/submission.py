@@ -31,6 +31,8 @@ INCLUDE = [
     "src/deepsick_attack/config.py",
     "src/deepsick_attack/events.py",
     "src/deepsick_attack/models.py",
+    "src/deepsick_attack/llm.py",
+    "src/deepsick_attack/tsecbench.py",
     "src/deepsick_attack/path_score.py",
     "src/deepsick_attack/stage_runner.py",
     "src/deepsick_attack/submission.py",

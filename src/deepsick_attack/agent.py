@@ -67,7 +67,8 @@ def close_intent(bb, intent: Intent) -> None:
 
 
 def run_target(target_id: int, policy: dict, workspace: str | Path,
-               max_steps: int = 24, inject_failure: str | None = None) -> dict:
+               max_steps: int = 24, inject_failure: str | None = None,
+               llm=None) -> dict:
     runner = StageRunner(policy)
     matcher = PathMatcher(
         runner.ids,
@@ -79,7 +80,7 @@ def run_target(target_id: int, policy: dict, workspace: str | Path,
     allowlist = policy["scope_allowlist"]
     address = allowlist[(target_id - 1) % len(allowlist)]
     bb = Blackboard(workspace, target_id)
-    llm = OfflineLLM()
+    llm = llm or OfflineLLM()
     executor = OfflineExecutor(fail_once_on=inject_failure)
     hint_engine = HintEngine(runner)
 

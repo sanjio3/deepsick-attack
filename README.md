@@ -57,6 +57,32 @@ python -m unittest discover -s tests -v
 
 覆盖配置校验、路径打分、退出判据、判定器、黑板状态与端到端两条执行路径。离线自检还会注入一次阶段失败，验证只在阶段内兜底、不跨阶段跳步。
 
+## 模型配置
+
+在项目根创建 `.env`，该文件已被 `.gitignore` 忽略，提交物白名单也不包含它。可用变量：
+
+- `MINIMAX_API_KEY`：必填，从 MiniMax 开放平台获取。
+- `MINIMAX_BASE_URL`：默认 `https://api.minimax.cn/anthropic`。
+- `MINIMAX_MODEL`：默认 `MiniMax-M3.1-Flash`。
+- `MINIMAX_EFFORT`：思考深度，默认 `low`，可选 `medium` / `high` / `xhigh` / `max`。
+- `MINIMAX_MAX_TOKENS`：默认 4096，过小会因 thinking 占满而没有文本输出。
+
+python run.py llm-check
+
+python run.py run --target 1 --backend minimax
+
+真实模型只负责把阶段动作模板展开成具体命令。若模型输出不在当前阶段允许集合内，代码会回退到官方标准动作，避免幻觉或跳步破坏路径匹配度。默认 `--backend offline`，不消耗 token。
+
+## TSecBench 试跑
+
+python run.py bench-sets
+
+python run.py bench-set --set bs-6c730ae2487f
+
+python run.py bench-run --set bs-6c730ae2487f
+
+题集列表与详情可匿名读取；创建评测需要平台 OAuth token，通过环境变量 `TSECBENCH_TOKEN` 提供，不要写进项目文件。评测平台会记录执行轨迹与工具调用，本地补写的轨迹不能替代真实动作。
+
 ## CI 状态
 
 GitHub Actions 工作流配置保存在 `docs/ci-workflow.yml`。当前 GitHub 令牌缺少 `workflow` scope，无法推送 `.github/workflows/` 下的文件，因此 Actions 暂未启用。补齐 scope 后把该文件移到 `.github/workflows/ci.yml` 并提交即可启用，CI 会在 Python 3.10 到 3.13 上跑同一组单测、配置校验与离线自检。
