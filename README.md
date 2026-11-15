@@ -57,6 +57,10 @@ python -m unittest discover -s tests -v
 
 覆盖配置校验、路径打分、退出判据、判定器、黑板状态与端到端两条执行路径。离线自检还会注入一次阶段失败，验证只在阶段内兜底、不跨阶段跳步。
 
+## CI 状态
+
+GitHub Actions 工作流配置保存在 `docs/ci-workflow.yml`。当前 GitHub 令牌缺少 `workflow` scope，无法推送 `.github/workflows/` 下的文件，因此 Actions 暂未启用。补齐 scope 后把该文件移到 `.github/workflows/ci.yml` 并提交即可启用，CI 会在 Python 3.10 到 3.13 上跑同一组单测、配置校验与离线自检。
+
 ## 赛场接入
 
 只需替换 `src/deepsick_attack/backends.py` 里的两个类：把 `LLMClient` 换成真实模型客户端，把 `Executor` 换成授权范围内的确定性工具执行器。主循环、判定器与路径验收不需要改。每一步必须产生真实工具输出，平台侧靠流量与审计日志还原路径。

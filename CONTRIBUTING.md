@@ -38,4 +38,4 @@ python run.py validate
 
 python run.py self-test
 
-三条全过再提 PR。CI 会在 Python 3.10 到 3.13 上重复同一组检查。
+三条全过再提 PR。工作流配置见 `docs/ci-workflow.yml`，启用后 CI 会在 Python 3.10 到 3.13 上重复同一组检查。
