@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -359,7 +360,7 @@ def assemble(config: dict, layer_files: list[tuple[str, str, int]],
         cfg = json.loads(json.dumps(config))  # deep copy
         created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         env = cfg["config"].get("Env") or []
-        for kv in ("PYTHONDONTWRITEBYTECODE=1", "PYTHONUNBUFFERED=1", "PYTHONPATH=/app/src"):
+        for kv in ("PYTHONDONTWRITEBYTECODE=1", "PYTHONUNBUFFERED=1", "PYTHONPATH=/app/src:/app/vendor/site-packages"):
             key = kv.split("=")[0] + "="
             env = [e for e in env if not e.startswith(key)]
             env.append(kv)
@@ -454,7 +455,7 @@ def _image_config(config: dict, diff_ids: list[str]) -> bytes:
     cfg = json.loads(json.dumps(config))
     created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     env = cfg["config"].get("Env") or []
-    for kv in ("PYTHONDONTWRITEBYTECODE=1", "PYTHONUNBUFFERED=1", "PYTHONPATH=/app/src"):
+    for kv in ("PYTHONDONTWRITEBYTECODE=1", "PYTHONUNBUFFERED=1", "PYTHONPATH=/app/src:/app/vendor/site-packages"):
         prefix = kv.split("=")[0] + "="
         env = [e for e in env if not e.startswith(prefix)]
         env.append(kv)
@@ -627,8 +628,8 @@ def verify_oci(path: str) -> bool:
         if c.get("WorkingDir") != "/app":
             log(f"  [FAIL] WorkingDir 异常 {c.get('WorkingDir')}")
             ok = False
-        if "PYTHONPATH=/app/src" not in (c.get("Env") or []):
-            log("  [FAIL] 缺少 PYTHONPATH=/app/src")
+        if "PYTHONPATH=/app/src:/app/vendor/site-packages" not in (c.get("Env") or []):
+            log("  [FAIL] 缺少 PYTHONPATH=/app/src:/app/vendor/site-packages")
             ok = False
         app_name = f"blobs/sha256/{layers[-1]['digest'].split(':', 1)[1]}"
         with tarfile.open(fileobj=io.BytesIO(gzip.decompress(tar.extractfile(app_name).read())),
@@ -693,8 +694,8 @@ def verify(path: str) -> bool:
             log(f"  [FAIL] WorkingDir 异常：{c.get('WorkingDir')}")
             ok = False
         env = c.get("Env") or []
-        if "PYTHONPATH=/app/src" not in env:
-            log("  [FAIL] 缺少 PYTHONPATH=/app/src")
+        if "PYTHONPATH=/app/src:/app/vendor/site-packages" not in env:
+            log("  [FAIL] 缺少 PYTHONPATH=/app/src:/app/vendor/site-packages")
             ok = False
         # 确认应用层里确实有包
         app_layer = layers[-1]
@@ -722,6 +723,26 @@ def verify(path: str) -> bool:
 # ---------------------------------------------------------------- 入口
 
 
+def ensure_vendor() -> None:
+    """确保 vendor/site-packages 已由轮子解包出来。
+
+    依赖以 manylinux 轮子随源码入库，解包是纯文件操作（zipfile），不需要 pip
+    也不需要网络，所以能进零 daemon 的构建路径。
+    """
+    target = os.path.join(ROOT, "vendor", "site-packages")
+    marker = os.path.join(target, "paramiko", "__init__.py")
+    if os.path.exists(marker):
+        return
+    script = os.path.join(ROOT, "vendor", "install_vendor.py")
+    if not os.path.exists(script):
+        log("警告：vendor/install_vendor.py 不存在，镜像内将没有 SSH/DNS 依赖")
+        return
+    log("解包 vendor 依赖")
+    result = subprocess.run([sys.executable, script], cwd=ROOT)
+    if result.returncode != 0:
+        log("警告：vendor 依赖解包失败，SSH/DNS 分支会降级")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="不依赖 Docker daemon 构建镜像 tar.gz")
     parser.add_argument("--format", choices=["oci", "docker"], default="oci",
@@ -740,6 +761,9 @@ def main() -> int:
         return 0 if (verify_oci(target) if args.format == "oci" else verify(target)) else 1
 
     log(f"基线：不使用 Docker daemon，按 Registry V2 + {'OCI Image Layout' if args.format == 'oci' else 'docker-save 布局'}组装")
+
+    ensure_vendor()
+
     reg = pick_mirror()
     config, layer_files, base_digest = resolve_base(reg)
     log(f"基础镜像 digest {base_digest}")

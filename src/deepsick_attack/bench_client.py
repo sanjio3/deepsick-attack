@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import urllib.error
@@ -130,10 +131,10 @@ class HintResult:
 class SubmitResult:
     correct: bool
     awarded: int
-    cumulative_score: int
-    correct_flag_count: int
-    total_flag_count: int
-    matched_flag_index: int | None
+    cumulative_score: int = 0
+    correct_flag_count: int = 0
+    total_flag_count: int = 0
+    matched_flag_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -229,6 +230,17 @@ def stub_solver(challenge: Challenge, started: StartResult) -> list[str]:
     return []
 
 
+def _accepts_submit(fn) -> bool:
+    """解题器是否接受 submit 回调。有就实时提交，拿平台反馈当信号。"""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if "submit" in params:
+        return True
+    return any(p.kind == p.VAR_KEYWORD for p in params.values())
+
+
 def run_benchmark(solver: Callable[[Challenge, StartResult], list[str]] | None = None,
                   client: ChallengesClient | None = None) -> dict:
     """按官方顺序驱动一轮评测，串行处理题目，保证最多 1 个活跃容器。"""
@@ -249,20 +261,32 @@ def run_benchmark(solver: Callable[[Challenge, StartResult], list[str]] | None =
         summary["started"] += 1
         emit("bench_started", unique_code=challenge.unique_code,
              container_addr=started.container_addr)
+
+        def submit_one(flag: str, code: str = challenge.unique_code):
+            """提交一条候选并把结果计入汇总。重复提交按幂等跳过。"""
+            try:
+                result = client.submit_flag(code, flag)
+            except DuplicateSubmit:
+                emit("bench_duplicate", unique_code=code, note="幂等跳过")
+                return SubmitResult(correct=False, awarded=0,
+                                    correct_flag_count=0, total_flag_count=0)
+            summary["submitted"] += 1
+            if result.correct:
+                summary["correct"] += 1
+                summary["awarded"] += result.awarded
+            emit("bench_submit", unique_code=code, correct=result.correct,
+                 awarded=result.awarded,
+                 progress=f"{result.correct_flag_count}/{result.total_flag_count}")
+            return result
+
+        live = _accepts_submit(solver)
         try:
-            for flag in list(solver(challenge, started) or []):
-                try:
-                    result = client.submit_flag(challenge.unique_code, flag)
-                    summary["submitted"] += 1
-                    if result.correct:
-                        summary["correct"] += 1
-                        summary["awarded"] += result.awarded
-                    emit("bench_submit", unique_code=challenge.unique_code,
-                         correct=result.correct, awarded=result.awarded,
-                         progress=f"{result.correct_flag_count}/{result.total_flag_count}")
-                except DuplicateSubmit:
-                    emit("bench_duplicate", unique_code=challenge.unique_code,
-                         note="幂等跳过")
+            if live:
+                # 解题器自己提交，用平台反馈决定是否继续挖
+                solver(challenge, started, submit=submit_one)
+            else:
+                for flag in list(solver(challenge, started) or []):
+                    submit_one(flag)
         finally:
             closed = client.close_challenge(challenge.unique_code)
             summary["closed"] += 1

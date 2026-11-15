@@ -21,3 +21,6 @@ LIVE_CRED.txt
 config/policy.local.json
 config/*.local.json
 *.zip
+
+# vendor 依赖：轮子入库（构建输入，7MB），解包产物不入库（由 install_vendor.py 生成）
+vendor/site-packages/

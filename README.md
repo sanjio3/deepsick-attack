@@ -95,25 +95,84 @@ python -m deepsick_attack bench-solve --solver auto
 
 ## 解题器
 
-`src/deepsick_attack/solver.py` 是真实靶标执行器，沿用本项目「生成与判定分离」的硬规则：
+评测里跑的是 `bench-solve`，入口是 `solver.py`。它是四层结构，每层各管一件事，
+模型只在第 3 层出现：
 
-- 模型只负责在固定工具集里挑下一个动作并给出判断理由，每轮输出一个 JSON 对象。
-- 动作由代码真正执行并记录观测，观测再回灌给模型，形成闭环。
-- Flag 由代码用正则从真实响应里独立提取，模型自报的 Flag 必须能在观测里找到出处才提交，找不到就拒绝。这样即使模型幻觉，也不会把编造的字符串交上去。
+### 感知层（`sense.py`）
 
-Flag 提取分强弱两档。强特征（`flag{...}`、`CTF{...}`、`TSEC{...}` 这类明确前缀，以及 `flag-xxxxxxxx` 形式）直接采信；弱特征（任意 `xxx{...}`）必须在命中位置前后 200 字符内出现 flag 语义旁证（`flag`/`secret`/`congrat`/`答案是` 等），否则丢弃并推一条 `flag_suspect_skipped`。这一档是必需的：单用宽正则会把网页里的 JS/CSS 片段（`.cls{a:b}`、`foo{bar:2}`）当成 Flag 提交，实测出现过单题 5 次 `answer_wrong`。单题提交候选还封顶 15 条，提交次数是有成本的信号，不能无限往里灌。
+平台返回的 `container_addr` 只是线索，不是攻击面——同一宿主机 IP 上映射着多道题的
+不同端口，给了 `:22` 不代表这题只有 SSH。所以开场由代码自己扫、自己抓 banner、自己
+判协议，不经过模型。
 
-模型宣布收工但一条都没核验上时，本题不会立刻结束：系统把「你说的 Flag 找不到出处」作为一次观测推回去，要求继续侦察，连续两次放弃才真的收工（`solve_give_up_denied`）。原因是模型常在三四步就交白卷，白扔剩下的十几分钟预算。
+- TCP connect 扫描，默认只扫**提示端口及其 ±10 邻域**。这一条是被实测逼出来的：
+  扫全端口表会命中同一台上别的题的服务，把 agent 引去攻击错误容器。`deep=True`
+  才升级到 200 个常用端口（模型发现该有东西的地方没东西时会主动调 `rescan`）。
+- banner 抓取按原始字节判协议：SSH / HTTP / TLS / FTP / SMTP / POP3 / IMAP /
+  MySQL / Redis / VNC。协议由字节决定，不由端口号猜——靶标常用 30000+ 的随机端口
+  跑 HTTP。
+- Web 入口选择以 fingerprint 判出的协议为准，且**提示端口优先**，不用「碰到的第
+  一个 http 服务」。
+- UDP 探测与 mDNS 服务发现（动态靶标靠 mDNS 公布真实端口），DNS 查询（TXT 常藏 flag）。
 
-工具集全部基于标准库，因为 `python:3.11-slim` 里没有 nmap、curl、nc：`http_request`（带 cookie 保持）、`http_get`、`http_post`、`port_scan`、`tcp_send`（原始 TCP，用于非 HTTP 服务）、`shell`（沙箱内执行，带超时）、`decode`（base64 / hex / url / rot13）。
+### 事实板（`facts.py`）
 
-打靶流量强制直连：工具集显式关闭代理，`shell` 也会剥掉 `*_proxy` 环境变量。否则环境里若存在出网代理，发往靶标的请求会被塞进代理，表现为 502 而不是靶标响应。
+观测压成结构化事实并落 jsonl：service / route / credential / tripwire / artifact /
+flag，每条带 `risk`。给模型看的是事实摘要，不是最近 8 条原文——旧实现 1800 字符一
+截断，第 3 步发现的东西第 10 步就丢了。容器被杀、上下文被裁，状态都还在。
 
-上下文成本是受控的：每步只发「题面 + 最近 8 步观测」，不累积历史消息，避免 token 随步数平方增长撑爆窗口。单题受 `--challenge-seconds`（默认 780 秒）与 `--max-steps`（默认 40）双重约束，整轮再受 `--total-seconds`（默认 6300 秒）约束。单题上限取 13 分钟而不是 15 分钟，是为了给整轮留出余量——上一轮 7 道题各占满 900 秒，正好吃光 6300 秒总预算，最后一道题拿到 0 秒被直接跳过。
+### 候选意图（`playbook.py`）
+
+模型不再在无限动作空间里自由编 JSON，而是从代码根据事实生成的 4-8 条候选里挑一条
+（`{"pick": "http:80:home"}`），必要时才自己写动作。决策面从「任意动作」缩到
+「N 选 1」，这是 Flash 级模型能力范围内能做的判断。
+
+候选生成带策略：命中 risky（疑似蜜罐/主动防御）服务的候选排到队尾；已试过的候选
+直接剔除；`http:*:missing` 这条是对必然不存在的路径发请求，用「是否也返回 200」
+做最便宜的蜜罐识别。
+
+### 探测器与提交
+
+`playbook.detect()` 只吃真实字节，模型自述不参与：是否出 flag、是否命中主动防御话术
+（detected/blocked/封禁/蜜罐等）、是否「太配合」（一次请求就给 root 或私钥）。
+
+提交策略是**疑似即提交**。强特征（`flag{...}`、`CTF{...}`、`TSEC{...}`）直接交；
+弱特征（任意 `xxx{...}`）只要花括号内不是代码语法就交。唯一硬性过滤是代码片段：
+括号里出现 `:` `;` `(` `)` `'` `"` `=` `/` `<` `>` 的一律丢弃——`.cls{a:b}`、
+`foo{bar:2}` 属于这种，实测曾让单题出现 5 次 `answer_wrong`。
+
+上一轮曾把闸门收到「弱特征必须有语义旁证」，结果是**整轮 0 次提交**。0 次提交拿不
+到任何反馈，比交错了更糟，所以现在改成宁可交、由平台判。提交实时进行，用平台返回的
+`correct` 与「已中几/共几个」当反馈。单题封顶 15 条。
+
+模型输出空 `flags` 不会结束本题，只是被要求继续换候选。
+
+### 工具集
+
+标准库部分：`http_request`（保持 cookie）、`http_get`、`http_post`、`port_scan`、
+`tcp_send`、`shell`、`decode`、`udp_probe`、`mdns`、`dns_query`。
+
+`vendor/` 下的 manylinux 轮子提供 SSH 与 DNS 能力：`ssh_audit`（读版本与允许的认证
+方式）、`ssh_login`（只试 4 组常见口令，不做字典爆破，登录后自动找 flag 文件）。
+7 道题里有 3 道只暴露 `:22`，纯标准库打不动。缺依赖时这些工具降级返回说明，不抛异常。
+
+打靶流量强制直连：工具集显式关闭代理，`shell` 也剥掉 `*_proxy`。环境里若有出网代理，
+发往靶标的请求会被塞进代理，表现为 502 而不是靶标响应。
+
+节奏控制：同一主机两次动作之间至少间隔 0.9 秒；同一动作连续三次触发 loop guard 强制
+换路。主动防御类靶标对高频请求敏感，打得太急会被判定为扫描器。
+
+上下文成本：每步只发「题面 + 事实摘要 + 候选 + 最近 3 步原始观测」，不累积历史消息。
+单题受 `--challenge-seconds`（默认 780 秒）与 `--max-steps`（默认 40）双重约束，整轮
+受 `--total-seconds`（默认 6300 秒）约束。单题取 13 分钟而不是 15 分钟，是为了给整轮
+留余量：上一轮 7 道题各占满 900 秒，正好吃光 6300 秒总预算，最后一道拿到 0 秒被跳过。
 
 ## 平台托管镜像
 
-`Dockerfile` 以 `python:3.11-slim` 为基础，零 pip 依赖，入口为 `python -m deepsick_attack bench-solve`。`.dockerignore` 已排除 `.env` 与所有运行产物，凭据不会进入镜像。
+`Dockerfile` 以 `python:3.11-slim` 为基础，入口为 `python -m deepsick_attack bench-solve`。`.dockerignore` 已排除 `.env` 与所有运行产物，凭据不会进入镜像。
+
+第三方依赖以 **manylinux 轮子入库**（`vendor/wheels/`，7MB），构建期由 `vendor/install_vendor.py` 解包成 `vendor/site-packages/` 并加进 `PYTHONPATH`。这样零 daemon 构建与 Docker 构建产出一致，运行期不装 pip、不联网。轮子是 `manylinux2014_x86_64` + `cp311`，对应基础镜像的 ABI。重新取轮子：
+
+python -m pip download --only-binary=:all: --platform manylinux2014_x86_64 --python-version 311 --no-deps -d vendor/wheels paramiko cryptography bcrypt pynacl cffi pycparser dnspython
 
 bash build_image.sh
 
@@ -125,7 +184,7 @@ bash build_image.sh
 
 python build_image_offline.py
 
-它按 Registry V2 协议从可访问的镜像源拉取基础层（`docker.m.daocloud.io` 等国内镜像站），按 OCI 布局组装并 gzip，`--format docker` 可退回 legacy 布局做兼容验证。构建过程自校验：`oci-layout` 与 `index.json` 齐备、index→manifest→config 引用链完整、每个层压缩后 digest 与解压后 diff_id 双重核对、Entrypoint / WorkingDir / PYTHONPATH 正确、入口文件存在且没有混入 `.env`。任一项不通过就报错退出，不产出坏镜像。
+它会先确认 vendor 依赖已解包，再按 Registry V2 协议从可访问的镜像源拉取基础层（`docker.m.daocloud.io` 等国内镜像站），按 OCI 布局组装并 gzip，`--format docker` 可退回 legacy 布局做兼容验证。构建过程自校验：`oci-layout` 与 `index.json` 齐备、index→manifest→config 引用链完整、每个层压缩后 digest 与解压后 diff_id 双重核对、Entrypoint / WorkingDir / PYTHONPATH 正确、入口文件存在且没有混入 `.env`。任一项不通过就报错退出，不产出坏镜像。
 
 python build_image_offline.py --verify-only
 

@@ -152,7 +152,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if result["proved"] else 1
 
     if args.command == "self-test":
-        summary = self_test(policy, args.workspace)
+        # 自检必须从空工作区开始。Blackboard 是按目标落盘的，上一轮的
+        # trace.jsonl 会让本次「恢复」到已完成的路径上，一步不执行却报
+        # proved=False（反过来也可能掩盖问题）。所以这里用一次性临时目录。
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="deepsick-selftest-") as tmp:
+            summary = self_test(policy, tmp)
         return 0 if (summary["normal"]["proved"]
                      and summary["with_failure"]["proved"]) else 1
 
