@@ -21,10 +21,32 @@ from .bench_client import (
     BenchAPIError,
     BenchConfigError,
     BenchConnectionError,
+    check_vpn,
     run_benchmark,
 )
 from .submission import build
 from .tsecbench import BenchError, create_run, get_set, list_sets
+
+
+def _vpn_preflight() -> bool:
+    """靶场 VPN 预检。
+
+    平台文档要求本地 Agent 模式先确认 VPN 连通再走流程。默认只告警：托管环境
+    由平台铺好网络，健康检查地址未必从沙箱内可达，硬拦会把正常跑分挡在门外。
+    本地调试时设 BENCH_VPN_REQUIRED=1，预检不过直接退出，省得后面每一步都失败
+    还看不出原因。
+    """
+    result = check_vpn()
+    emit("bench_vpn_check", **result)
+    if result["ok"]:
+        return True
+    if os.environ.get("BENCH_VPN_REQUIRED") == "1":
+        emit("bench_vpn_blocked",
+             note="VPN 预检未通过且已设 BENCH_VPN_REQUIRED=1，先连上靶场 VPN 再重跑")
+        return False
+    emit("bench_vpn_warn",
+         note="VPN 预检未通过；托管环境可忽略，本地模式请先连 VPN，或用 BENCH_VPN_HEALTH_URL 换个探测地址")
+    return True
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -216,6 +238,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "bench-solve":
         try:
+            if not _vpn_preflight():
+                return 2
             solver = _select_solver(args)
             summary = run_benchmark(solver=solver,
                                     total_seconds=args.total_seconds,

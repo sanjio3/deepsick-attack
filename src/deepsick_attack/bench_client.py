@@ -191,8 +191,11 @@ class ChallengesClient:
             raise error_cls(code, str(payload.get("message") or text[:300]),
                             payload.get("detail", {}), exc.code) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # 只留异常类名的话，日志里全是 `URLError`——完全分不清是 VPN 没连、
+            # DNS 挂了还是端口不通。把 reason 一起带上，本地调试才有得看。
+            reason = getattr(exc, "reason", None) or str(exc) or "无详细信息"
             raise BenchConnectionError(
-                f"请求 {method} {path} 失败：{type(exc).__name__}"
+                f"请求 {method} {path} 失败：{type(exc).__name__}: {reason}"[:300]
             ) from exc
 
     def list_challenges(self) -> list[Challenge]:
@@ -268,6 +271,46 @@ def _retry_delay() -> float:
         return max(0.0, float(os.environ.get("BENCH_RETRY_DELAY", "3")))
     except ValueError:
         return 3.0
+
+
+VPN_HEALTH_URL = "http://10.0.100.58"
+VPN_HEALTH_TIMEOUT = 5.0
+
+
+def check_vpn(url: str | None = None, timeout: float | None = None) -> dict:
+    """靶场 VPN 连通预检。
+
+    平台文档把它列为本地 Agent 模式的「强制前置」：靶场地址只在 VPN 内可达，
+    VPN 没连上时后续每一步的失败形态都很杂（超时、连接被拒、个别端口不通），
+    从这些现象反推「VPN 没连」很费时间。单独探一次健康检查地址，把结论直接
+    写进事件，比让模型在轨迹里瞎猜有用得多。
+
+    默认只告警不中断，因为托管模式下这个地址未必可达；本地模式把
+    BENCH_VPN_REQUIRED=1 设上就变成硬闸门。
+    """
+    target = url or os.environ.get("BENCH_VPN_HEALTH_URL", VPN_HEALTH_URL)
+    try:
+        wait = timeout if timeout is not None else float(
+            os.environ.get("BENCH_VPN_TIMEOUT", str(VPN_HEALTH_TIMEOUT)))
+    except ValueError:
+        wait = VPN_HEALTH_TIMEOUT
+    started = time.time()
+    try:
+        with urllib.request.urlopen(target, timeout=wait) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+        payload = json.loads(raw) if raw.strip() else {}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "target": target, "client_ip": None,
+                "elapsed": round(time.time() - started, 2),
+                "detail": f"{type(exc).__name__}: {exc}"[:200]}
+    if not isinstance(payload, dict):
+        return {"ok": False, "target": target, "client_ip": None,
+                "elapsed": round(time.time() - started, 2),
+                "detail": f"非对象响应: {type(payload).__name__}"}
+    ok = payload.get("status") == "ok"
+    return {"ok": ok, "target": target, "client_ip": payload.get("client_ip"),
+            "elapsed": round(time.time() - started, 2),
+            "detail": "" if ok else f"status={payload.get('status')!r}"[:200]}
 
 
 SECOND_PASS_HINT = (
@@ -395,14 +438,25 @@ def run_benchmark(solver: Callable[[Challenge, StartResult], list[str]] | None =
         for pass_no in range(1, total_passes + 1):
             seen: set[str] = set()
             idle_rounds = 0
+            list_fail = 0
             emit("bench_pass", pass_no=pass_no, total=total_passes)
             while time.time() < deadline:
                 try:
                     challenges = client.list_challenges()
+                    list_fail = 0
                 except Exception as exc:  # noqa: BLE001
                     bump("errors")
+                    list_fail += 1
                     emit("bench_list_error",
-                         detail=f"{type(exc).__name__}: {exc}"[:200], note="重取列表")
+                         detail=f"{type(exc).__name__}: {exc}"[:200],
+                         streak=list_fail, note="重取列表")
+                    # 不自行退出：token 错或 VPN 没连时列表永远失败，但容器退出会
+                    # 让整轮看起来「莫名其妙停了」（48259 就是这么被误判的）。
+                    # 每 20 次吼一声，让轨迹里能看出是网络问题而不是卡死。
+                    if list_fail % 20 == 0:
+                        emit("bench_list_stalled", streak=list_fail,
+                             note="列表连续失败，多为 token/BaseUrl 不对或 VPN 未连通；"
+                                  "容器保持运行，不自行退出")
                     time.sleep(_idle_seconds())
                     continue
                 with lock:

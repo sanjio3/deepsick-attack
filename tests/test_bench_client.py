@@ -14,8 +14,10 @@ from deepsick_attack.bench_client import (  # noqa: E402
     MAX_WORKERS,
     _workers,
     BenchConfigError,
+    BenchConnectionError,
     Challenge,
     ChallengesClient,
+    check_vpn,
     ResourceUnavailable,
     CloseResult,
     DuplicateSubmit,
@@ -24,6 +26,9 @@ from deepsick_attack.bench_client import (  # noqa: E402
     ValidationError,
     run_benchmark,
 )
+
+
+from deepsick_attack.events import set_sink  # noqa: E402
 
 
 class FakeResponse:
@@ -198,6 +203,29 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(summary["errors"], 3)  # 三次尝试后放弃该题
         self.assertEqual(summary["closed"], 0)
 
+    def test_list_failures_stay_alive_and_shout(self):
+        """列表一直失败（token 错 / VPN 没连）不能自己退出，但要在轨迹里喊出来。"""
+        class DeadClient(FakeClient):
+            def list_challenges(self):
+                self.calls.append("list")
+                raise BenchConnectionError(
+                    "请求 GET /openapi/v1/challenges 失败：URLError: [Errno 111] "
+                    "Connection refused")
+
+        events = []
+        set_sink(events.append)
+        try:
+            summary = run_benchmark(lambda ch, started: [], client=DeadClient(),
+                                    total_seconds=1, passes=1)
+        finally:
+            set_sink(None)
+        self.assertEqual(summary["started"], 0)
+        self.assertTrue(any(e["event"] == "bench_list_stalled" for e in events),
+                        "连续失败 20 次必须留下 bench_list_stalled")
+        # 只说 URLError 是没法归因的，reason 要带出来
+        detail = [e for e in events if e["event"] == "bench_list_error"][0]["detail"]
+        self.assertIn("Connection refused", detail)
+
     def test_list_is_repolled_for_late_challenges(self):
         """平台下发的列表可能只是当下可启动的子集，处理完要再取一次。"""
         class LateClient(FakeClient):
@@ -349,6 +377,39 @@ class SecondPassTest(unittest.TestCase):
         summary = run_benchmark(solver, client=client, passes=1, only="a-04")
         self.assertEqual(seen, ["a-04"])
         self.assertEqual(summary["started"], 1)
+
+
+class VpnCheckTest(unittest.TestCase):
+    """本地 Agent 模式要求先确认 VPN 连通，否则后面每一步失败都没法归因。"""
+
+    def setUp(self):
+        self.saved = {k: os.environ.pop(k, None)
+                      for k in ("BENCH_VPN_HEALTH_URL", "BENCH_VPN_TIMEOUT")}
+
+    def tearDown(self):
+        for key, value in self.saved.items():
+            os.environ.pop(key, None)
+
+    def test_ok_payload_passes(self):
+        payload = {"client_ip": "10.0.0.1", "status": "ok",
+                   "time": "2026-06-24 16:27:33"}
+        with patch("urllib.request.urlopen", return_value=FakeResponse(payload)):
+            result = check_vpn(url="http://10.0.100.58", timeout=1)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["client_ip"], "10.0.0.1")
+
+    def test_unreachable_is_not_fatal_by_itself(self):
+        with patch("urllib.request.urlopen", side_effect=OSError("network unreachable")):
+            result = check_vpn(url="http://10.0.100.58", timeout=1)
+        self.assertFalse(result["ok"])
+        self.assertIn("network unreachable", result["detail"])
+
+    def test_wrong_status_is_reported(self):
+        with patch("urllib.request.urlopen",
+                   return_value=FakeResponse({"status": "degraded"})):
+            result = check_vpn(url="http://10.0.100.58", timeout=1)
+        self.assertFalse(result["ok"])
+        self.assertIn("degraded", result["detail"])
 
 
 if __name__ == "__main__":
