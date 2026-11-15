@@ -62,7 +62,10 @@ _SESSION_COOKIE_RE = re.compile(
 _LOGIN_HINT_RE = re.compile(
     r"(?:password|passwd|pwd)\s*=|login|signin|登录|认证", re.I)
 # 连续多少步没有新事实就放弃这道题
-STALE_ABANDON = 25
+# 连续多少步没有新事实就收手。实测有价值的进展都发生在前十几步：a-04 第 10 步
+# 拿到 RCE，a-17 前 5 步解出凭据，之后 20 步全在重复同一件事。
+# 阈值 25 意味着每道卡住的题要白烧 5-8 分钟，63 题跑一轮就是几小时。
+STALE_ABANDON = 18
 BANNER_CLIP = 700
 # 静态工具放在这里，由镜像构建期铺进 /app/vendor/bin
 TOOL_BIN_DIR = "/app/vendor/bin"
@@ -1084,7 +1087,8 @@ def _build_pick_prompt(challenge: Challenge, context: SolveContext) -> str:
         lines.append("- 没有可用候选，直接写命令")
     if context.attempts:
         lines += ["", "## 已经跑过的动作（**不要再跑一遍**，输出就在下面摘要里）"]
-        lines += context.attempts[-14:]
+        # 条数别太少：模型重复做同一件事，往往是因为它看不到自己做过什么
+        lines += context.attempts[-24:]
     if context.excluded:
         tried = sorted(context.excluded.items(), key=lambda kv: -kv[1])[:10]
         lines += ["", "## 已排除（这些族在对应路径上失败过，换族而不是换写法）"]

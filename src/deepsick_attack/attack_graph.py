@@ -144,6 +144,12 @@ _AJAX_CALL_RE = re.compile(
 _METHOD_IN_CALL_RE = re.compile(r"""method\s*[:=]\s*['"`](\w+)['"`]""", re.I)
 _JSON_KEY_RE = re.compile(r"""['"]([A-Za-z_][A-Za-z0-9_]{0,30})['"]\s*:""")
 _BARE_KEY_RE = re.compile(r"""\b([A-Za-z_][A-Za-z0-9_]{0,30})\s*:""")
+# 文本里的裸路径（db.php、config.ini 这种）。前端代码和页面正文里到处都是，
+# 它们常常是唯一的入口线索——a-17 的诊断面板就是 db.php，模型读到第 22 步才
+# 提到，而收割边一直只抓固定清单，根本没去试过它。
+_BARE_PATH_RE = re.compile(
+    r"""["'`]([A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*\.(?:php|html?|asp|aspx|jsp|py|cgi|do|json|xml|ini|conf|txt))["'`]""",
+    re.I)
 
 
 
@@ -335,6 +341,12 @@ def extract_entries(text: str, base_path_prefix: str = "") -> list[Entry]:
     # 4) 前端脚本里的 API 调用：这是现代 Web 的主战场，参数在请求体里
     _add_api_specs(out, body)
 
+    # 5) 文本里的裸路径（db.php / config.ini 这类）：常常是唯一的入口线索
+    for match in _BARE_PATH_RE.finditer(body):
+        raw = match.group(1)
+        path = "/" + raw if not raw.startswith("/") else raw
+        _merge_entry(out, "GET", path, {}, "text")
+
     return [e for e in out.values() if e.path not in ("/", "", "#")]
 
 
@@ -513,12 +525,10 @@ class AttackGraph:
             # 的原料。模型自己 curl 常常只 grep 关键词，结构就丢了；这条边专门
             # 把表单和链接原样抓出来。
             #
-            # 收割目标优先用图里已知的页面路径（不带 query 的那些），再加一份
-            # 常见页面兜底。API 路径（带 ?action= 或 /api/ 前缀）不收割——它们
-            # 返回 JSON，没有表单可拿。
+            # 收割目标用图里已知的全部路径（页面和 API 都算：API 可能返回 JSON
+            # 配置表，a-17 的 hint 就提到「系统配置表」），再加一份常见页面兜底。
             page_paths = sorted({e.path for e in self.entries.values()
-                                 if not e.relative and "?" not in e.path
-                                 and not e.path.startswith("/api")})
+                                 if e.path and not e.path.endswith("/")})
             harvest = Edge("harvest", None,
                            payload_note=" ".join(page_paths),
                            why="已取得会话，收割业务页面里的表单与链接")

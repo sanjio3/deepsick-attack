@@ -216,17 +216,19 @@ def render(edge: Edge, base_url: str) -> str | None:
         return f"for p in {payloads}; do " + " ; ".join(calls) + " ; done"
 
     if edge.family == "harvest":
-        # 把业务页面里的表单与链接原样抓出来。只取结构不取全文：一条命令拿
-        # 到所有入口的参数名，比模型逐页 grep 快一个数量级。
-        # 目标优先用图里已知的页面路径，再加常见页面兜底。
-        extra = [p for p in (edge.payload_note or "").split() if p.startswith("/")]
+        # 把业务页面里的表单与链接原样抓出来，同时保留正文开头——API 返回的
+        # JSON 配置表就藏在正文里（a-17 的 hint 提到「系统配置表」）。
+        # 目标优先用图里已知的全部路径，再加常见页面兜底；相对路径要补斜杠。
+        extra = [p for p in (edge.payload_note or "").split() if p]
         paths = list(dict.fromkeys(list(HARVEST_PATHS) + extra))
-        arr = " ".join(_q(p) for p in paths)
+        norm = [(p if p.startswith("/") else "/" + p) for p in paths]
+        arr = " ".join(_q(p) for p in norm)
         return (f"BASE={_q(base_url.rstrip('/'))} ; for u in {arr}; do "
                 f"printf '=== %s\\n' \"$u\"; "
                 f"curl -sS -b {SESSION_FILE} -m 8 \"$BASE$u\" "
-                f"| grep -oE '<form[^>]*>|</form>|<input[^>]*>|href=\"[^\"]+\"' "
-                f"| head -40; done")
+                f"| tee {SCRATCH} | head -c 1200; echo; "
+                f"grep -oE '<form[^>]*>|</form>|<input[^>]*>|href=\"[^\"]+\"' "
+                f"{SCRATCH} | head -30; done")
 
     if edge.family == "recon":
         # 一次打完一整批敏感路径；命中的路径把正文一并打出来，图据此长出新入口。
