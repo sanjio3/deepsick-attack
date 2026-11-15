@@ -27,14 +27,28 @@ from typing import Any, Callable
 from .bench_client import Challenge, StartResult
 from .events import emit
 
-# 常见 CTF Flag 形态。命中即视为候选，最终仍要与观测文本比对。
-FLAG_PATTERNS = [
-    re.compile(r"[A-Za-z0-9_]{2,32}\{[^}\n\r]{1,200}\}"),
+# Flag 提取分两档。原来只用一个宽正则 [A-Za-z0-9_]{2,32}\{...\}，
+# 会把网页里的 JS/CSS 片段（如 .cls{a:b}）当成 Flag 提交，实测出现过
+# 单题 5 次 answer_wrong。现在：强特征直接采信，弱特征必须带语义上下文。
+STRONG_FLAG_PATTERNS = [
+    re.compile(r"(?i)\b(?:flag|ctf|tsec|tsb|tflag|hack|pwn)\{[^}\n\r]{1,200}\}"),
     re.compile(r"(?i)\bflag[-_][A-Za-z0-9]{6,64}\b"),
 ]
+WEAK_FLAG_PATTERN = re.compile(r"[A-Za-z0-9_]{2,32}\{[^}\n\r]{1,200}\}")
+
+# 弱特征要成立的旁证：命中位置前后 200 字符内出现这些词才认。
+FLAG_CONTEXT_HINTS = (
+    "flag", "secret", "answer", "correct", "congrat", "success", "you win",
+    "well done", "答案是", "恭喜", "正确", "提交", "这是你的", "拿到",
+)
+
+# 兼容旧调用方：对外仍暴露 FLAG_PATTERNS
+FLAG_PATTERNS = STRONG_FLAG_PATTERNS + [WEAK_FLAG_PATTERN]
 
 MAX_OBS_CHARS = 1800
-MAX_STEPS_HARD_CAP = 40
+MAX_STEPS_HARD_CAP = 60
+# 单题最多提交多少条候选。提交次数是有成本的信号，不能无限往里灌。
+MAX_FLAGS_PER_CHALLENGE = 15
 
 SYSTEM_PROMPT = """你是一个在隔离沙箱里运行的授权 CTF 解题智能体。你的目标是从靶标拿到 Flag。
 
@@ -55,11 +69,14 @@ SYSTEM_PROMPT = """你是一个在隔离沙箱里运行的授权 CTF 解题智�
 7. decode         args: {"value":"...","kind":"base64|hex|url|rot13"}
 
 硬性规则：
-- 不要编造 Flag。只有在你确实看到过时才写进 flags。
+- 不要编造 Flag。只有在你确实看到过时才写进 flags，系统会回查观测，对不上的一律丢弃。
 - 先侦察再攻击：先看清服务是什么、有哪些路径、什么参数，再构造利用。
 - 每次只做一步，观察结果再决定下一步。重复同样的请求没有意义，要换思路。
 - Flag 通常出现在响应体、报错信息、目录列表或某个文件里。找不到就扩大侦察面。
-- 如果某个方向连续失败两次，换一个方向。"""
+- 如果某个方向连续失败两次，换一个方向。
+- 只有在已经拿到 Flag 时才输出 flags 动作。没拿到就继续输出工具动作；
+  空 flags 会被系统追问一次，第二次才会真的结束本题，别拿它当省事的退出口。
+- 全局时间预算有限（单题约 15 分钟），侦察要有节奏，别把预算全花在探测上。"""
 
 
 @dataclass
@@ -316,18 +333,59 @@ class Toolkit:
             return f"工具 {tool} 执行异常: {type(exc).__name__}: {exc}"
 
 
-def extract_flags(text: str) -> list[str]:
-    """从观测文本里提取候选 Flag。去重、保持首次出现顺序。"""
+def _flag_context_hint(text: str, start: int, end: int,
+                       window: int = 200) -> str | None:
+    """命中位置前后 window 字符内是否有 flag 语义旁证，返回命中的提示词。"""
+    around = text[max(0, start - window):min(len(text), end + window)].lower()
+    for hint in FLAG_CONTEXT_HINTS:
+        if hint in around:
+            return hint
+    return None
+
+
+def extract_flags(text: str, strict: bool = False) -> list[str]:
+    """从观测文本里提取候选 Flag。去重、保持首次出现顺序。
+
+    两档判定：强特征（flag{...}/CTF{...} 之类）直接采信；弱特征（任意
+    `xxx{...}`）必须带语义旁证，否则丢弃并推一条 flag_suspect_skipped，
+    避免把网页里的 JS/CSS 片段当 Flag 提交。strict=True 只走强特征。
+    """
+    body = text if isinstance(text, str) else str(text or "")
+    if not body:
+        return []
     found: list[str] = []
-    seen = set()
-    for pattern in FLAG_PATTERNS:
-        for match in pattern.findall(text or ""):
-            value = match.strip()
+    seen: set[str] = set()
+    strong_spans: list[tuple[int, int]] = []
+
+    for pattern in STRONG_FLAG_PATTERNS:
+        for match in pattern.finditer(body):
+            value = match.group(0).strip()
             key = value.lower()
             if len(value) < 6 or key in seen:
                 continue
             seen.add(key)
             found.append(value)
+            strong_spans.append((match.start(), match.end()))
+
+    if strict:
+        return found
+
+    for match in WEAK_FLAG_PATTERN.finditer(body):
+        value = match.group(0).strip()
+        key = value.lower()
+        if len(value) < 6 or key in seen:
+            continue
+        if any(start <= match.start() and match.end() <= end
+               for start, end in strong_spans):
+            continue
+        hint = _flag_context_hint(body, match.start(), match.end())
+        if hint is None:
+            emit("flag_suspect_skipped", candidate=value[:120],
+                 reason="弱特征且前后 200 字符内无 flag 语义旁证")
+            continue
+        seen.add(key)
+        found.append(value)
+        emit("flag_weak_accepted", candidate=value[:120], hint=hint)
     return found
 
 
@@ -418,10 +476,10 @@ def solve_challenge(challenge: Challenge, started: StartResult,
 
     context = SolveContext(base_url=base_url, host=host, ports=ports)
     toolkit = Toolkit(context, shell_timeout=shell_timeout)
-    steps = max_steps or int(os.environ.get("BENCH_MAX_STEPS", "16"))
+    steps = max_steps or int(os.environ.get("BENCH_MAX_STEPS", "40"))
     steps = max(1, min(steps, MAX_STEPS_HARD_CAP))
     if deadline is None:
-        budget = int(os.environ.get("BENCH_CHALLENGE_SECONDS", "600"))
+        budget = int(os.environ.get("BENCH_CHALLENGE_SECONDS", "780"))
         deadline = time.time() + budget
 
     emit("solve_begin", unique_code=challenge.unique_code,
@@ -431,6 +489,7 @@ def solve_challenge(challenge: Challenge, started: StartResult,
     user_prompt = _build_user_prompt(challenge, context)
     verified: list[str] = []
     seen_flags: set[str] = set()
+    give_ups = 0
 
     for step in range(1, steps + 1):
         if time.time() >= deadline:
@@ -438,12 +497,14 @@ def solve_challenge(challenge: Challenge, started: StartResult,
             break
         # 每步独立构造单条消息：上下文只由「题面 + 最近几步观测」决定，
         # 不累积历史消息，避免 token 随步数平方增长撑爆窗口。
+        remaining = max(0, int(deadline - time.time()))
         turn = [
             user_prompt,
             "",
             "## 已有观测",
             _render_transcript(context),
             "",
+            f"## 进度\n第 {step}/{steps} 步，剩余约 {remaining} 秒。",
             "请输出下一步动作（单个 JSON 对象）。",
         ]
         started_at = time.time()
@@ -472,6 +533,7 @@ def solve_challenge(challenge: Challenge, started: StartResult,
             claimed = [str(f).strip() for f in (action.get("flags") or [])
                        if str(f).strip()]
             corpus = "\n".join(o.output for o in context.observations)
+            gained = 0
             for flag in claimed:
                 key = flag.lower()
                 if key in seen_flags:
@@ -479,15 +541,29 @@ def solve_challenge(challenge: Challenge, started: StartResult,
                 if flag in corpus:
                     seen_flags.add(key)
                     verified.append(flag)
+                    gained += 1
                     emit("solve_flag_verified", unique_code=challenge.unique_code,
                          step=step, flag=flag, source="模型声明且观测可核验")
                 else:
                     emit("solve_flag_rejected", unique_code=challenge.unique_code,
                          step=step, flag=flag[:120],
                          reason="观测里找不到出处，拒绝提交")
-            emit("solve_final", unique_code=challenge.unique_code, step=step,
-                 thought=thought, verified=len(verified))
-            break
+            # 模型宣布收工但一个都没核验上，不能就此停手——上一轮实测里
+            # 模型常在三四步就交白卷，把剩下的十几分钟预算全扔了。
+            give_ups += 1
+            if gained or give_ups >= 2:
+                emit("solve_final", unique_code=challenge.unique_code, step=step,
+                     thought=thought, verified=len(verified))
+                break
+            context.observations.append(Observation(
+                step, "(模型声称已收工)", {},
+                "你声称的 Flag 在已有观测里都找不到出处，因此一条都没被采信。"
+                "本题还没拿到 Flag，请继续侦察或换方向，仍然每次输出一个工具动作。"
+                "若确实无法继续，再输出一次 {\"flags\": []} 即结束本题。",
+                time.time() - started_at, thought))
+            emit("solve_give_up_denied", unique_code=challenge.unique_code,
+                 step=step, claimed=len(claimed))
+            continue
 
         tool = str(action.get("tool") or "")
         args = action.get("args") or {}
@@ -502,6 +578,10 @@ def solve_challenge(challenge: Challenge, started: StartResult,
 
         # 代码侧独立提取，不依赖模型是否注意到
         for flag in extract_flags(output):
+            if len(verified) >= MAX_FLAGS_PER_CHALLENGE:
+                emit("solve_flag_budget_full", unique_code=challenge.unique_code,
+                     step=step, cap=MAX_FLAGS_PER_CHALLENGE)
+                break
             key = flag.lower()
             if key in seen_flags:
                 continue
@@ -528,7 +608,9 @@ def make_llm_solver(*, max_steps: int | None = None,
     global_deadline = time.time() + total
 
     def solver(challenge: Challenge, started: StartResult) -> list[str]:
-        per = int(os.environ.get("BENCH_CHALLENGE_SECONDS", "600"))
+        # 单题上限取 780s（13 分钟）而不是 900s：上一轮 7 道题各占满 900s，
+        # 正好等于全局 6300s，最后一道题拿到 0 秒被直接跳过。
+        per = int(os.environ.get("BENCH_CHALLENGE_SECONDS", "780"))
         deadline = min(time.time() + per, global_deadline)
         if deadline <= time.time():
             emit("solve_skipped", unique_code=challenge.unique_code,

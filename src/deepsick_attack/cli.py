@@ -62,11 +62,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--solver", choices=["auto", "llm", "stub"], default="auto",
         help="auto: 有模型凭据用真实解题器，否则退回占位器（不提交任何 Flag）")
     bench_solve.add_argument("--max-steps", type=int, default=None,
-                             help="单题最大动作步数，默认取 BENCH_MAX_STEPS 或 12")
+                             help="单题最大动作步数，默认取 BENCH_MAX_STEPS 或 40")
     bench_solve.add_argument("--total-seconds", type=int, default=None,
-                             help="整轮总时间预算，默认取 BENCH_TOTAL_SECONDS 或 6000")
+                             help="整轮总时间预算，默认取 BENCH_TOTAL_SECONDS 或 6300")
     bench_solve.add_argument("--challenge-seconds", type=int, default=None,
-                             help="单题时间预算，默认取 BENCH_CHALLENGE_SECONDS 或 480")
+                             help="单题时间预算，默认取 BENCH_CHALLENGE_SECONDS 或 780")
 
     bench_set = sub.add_parser("bench-set", help="查看单个题集详情，无需 token")
     bench_set.add_argument("--set", required=True, metavar="SET_ID")

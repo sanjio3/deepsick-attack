@@ -212,7 +212,7 @@ def resolve_base(reg: Registry):
     for idx, layer in enumerate(layers):
         blob = os.path.join(CACHE, layer["digest"].replace(":", "_") + ".tar.gz")
         size = reg.get_blob(BASE_IMAGE, layer["digest"], blob)
-        layer_files.append((blob, diff_ids[idx], size))
+        layer_files.append((blob, diff_ids[idx], size, str(layer.get("mediaType") or "")))
         log(f"  层 {idx + 1}/{len(layers)} {layer['digest'][7:19]} {size / 1048576:.1f} MB")
     return config, layer_files, manifest_digest
 
@@ -342,7 +342,7 @@ def assemble(config: dict, layer_files: list[tuple[str, str, int]],
     try:
         # 1. 基础层解压 + 校验
         prepared: list[tuple[str, str]] = []  # (layer.tar 路径, id)
-        for idx, (blob, diff_id, _size) in enumerate(layer_files):
+        for idx, (blob, diff_id, _size, _mt) in enumerate(layer_files):
             plain = os.path.join(workdir, f"base-{idx}.tar")
             actual = gunzip_to(blob, plain)
             if actual != diff_id:
@@ -428,6 +428,222 @@ def assemble(config: dict, layer_files: list[tuple[str, str, int]],
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------- OCI 归档
+
+OCI_OUTPUT = os.path.join(DIST, "deepsick-attack-image-oci.tar.gz")
+
+# 平台侧按 OCI 规范校验（oci-layout + index.json），基础层的 docker 媒体类型统一换成 OCI 的。
+LAYER_MEDIA_MAP = {
+    "application/vnd.docker.image.rootfs.diff.tar.gzip":
+        "application/vnd.oci.image.layer.v1.tar+gzip",
+    "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip":
+        "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip",
+}
+OCI_LAYER_GZIP = "application/vnd.oci.image.layer.v1.tar+gzip"
+OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
+OCI_INDEX = "application/vnd.oci.image.index.v1+json"
+OCI_CONFIG = "application/vnd.oci.image.config.v1+json"
+
+
+def _norm_layer_media(media_type: str) -> str:
+    return LAYER_MEDIA_MAP.get(media_type or "", media_type or OCI_LAYER_GZIP)
+
+
+def _image_config(config: dict, diff_ids: list[str]) -> bytes:
+    """在原基础镜像 config 上叠加应用层与环境，返回序列化后的字节。"""
+    cfg = json.loads(json.dumps(config))
+    created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    env = cfg["config"].get("Env") or []
+    for kv in ("PYTHONDONTWRITEBYTECODE=1", "PYTHONUNBUFFERED=1", "PYTHONPATH=/app/src"):
+        prefix = kv.split("=")[0] + "="
+        env = [e for e in env if not e.startswith(prefix)]
+        env.append(kv)
+    cfg["config"]["Env"] = env
+    cfg["config"]["WorkingDir"] = "/app"
+    cfg["config"]["Entrypoint"] = ["python", "-m", "deepsick_attack", "bench-solve"]
+    cfg["config"]["Cmd"] = None
+    cfg["created"] = created
+    cfg["rootfs"]["diff_ids"] = list(diff_ids)
+    cfg.setdefault("history", []).append({
+        "created": created,
+        "created_by": "build_image_offline.py",
+        "comment": "app layer: deepsick-attack",
+    })
+    return json.dumps(cfg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def assemble_oci(config: dict, layer_files: list, app_layer_tar: str,
+                 app_diff_id: str, arch: str = "amd64", os_name: str = "linux") -> str:
+    """按 OCI Image Layout 组装 tar.gz：oci-layout / index.json / blobs/sha256/*。"""
+    os.makedirs(DIST, exist_ok=True)
+    work = tempfile.mkdtemp(prefix="ociasm-")
+    try:
+        blobs: dict[str, str] = {}
+        layer_desc = []
+
+        # 1. 基础层：镜像源给的已经是 gzip blob，digest 就是压缩后的 sha256，直接复用
+        for blob_path, diff_id, size, media in layer_files:
+            digest = sha256_file(blob_path)
+            blobs[digest] = blob_path
+            layer_desc.append({
+                "mediaType": _norm_layer_media(media),
+                "digest": "sha256:" + digest,
+                "size": size,
+            })
+        log(f"OCI 基础层 {len(layer_desc)} 个")
+
+        # 2. 应用层压成 gzip blob
+        app_gz = os.path.join(work, "app.tar.gz")
+        with open(app_layer_tar, "rb") as src, \
+                gzip.open(app_gz, "wb", compresslevel=6) as dst:
+            shutil.copyfileobj(src, dst, 1024 * 256)
+        app_digest = sha256_file(app_gz)
+        app_size = os.path.getsize(app_gz)
+        blobs[app_digest] = app_gz
+        layer_desc.append({"mediaType": OCI_LAYER_GZIP,
+                           "digest": "sha256:" + app_digest, "size": app_size})
+        log(f"OCI 应用层 {app_size / 1024:.1f} KB")
+
+        # 3. config blob
+        diff_ids = [item[1] for item in layer_files] + [app_diff_id]
+        cfg_bytes = _image_config(config, diff_ids)
+        cfg_digest = hashlib.sha256(cfg_bytes).hexdigest()
+        cfg_path = os.path.join(work, "config.json")
+        with open(cfg_path, "wb") as fh:
+            fh.write(cfg_bytes)
+        blobs[cfg_digest] = cfg_path
+
+        # 4. image manifest
+        manifest = {
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST,
+            "config": {"mediaType": OCI_CONFIG,
+                       "digest": "sha256:" + cfg_digest,
+                       "size": len(cfg_bytes)},
+            "layers": layer_desc,
+        }
+        man_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+        man_digest = hashlib.sha256(man_bytes).hexdigest()
+        man_path = os.path.join(work, "manifest.json")
+        with open(man_path, "wb") as fh:
+            fh.write(man_bytes)
+        blobs[man_digest] = man_path
+
+        # 5. index.json
+        index = {
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX,
+            "manifests": [{
+                "mediaType": OCI_MANIFEST,
+                "digest": "sha256:" + man_digest,
+                "size": len(man_bytes),
+                "platform": {"architecture": arch, "os": os_name},
+                "annotations": {"org.opencontainers.image.ref.name": IMAGE_TAG},
+            }],
+        }
+
+        # 6. 打成 tar.gz
+        tmp_out = OCI_OUTPUT + ".tmp"
+        with tarfile.open(tmp_out, "w", format=tarfile.GNU_FORMAT) as tar:
+            write_tar_member(tar, "oci-layout",
+                             data=json.dumps({"imageLayoutVersion": "1.0.0"},
+                                             separators=(",", ":")).encode())
+            write_tar_member(tar, "index.json",
+                             data=json.dumps(index, separators=(",", ":")).encode())
+            for digest, src in blobs.items():
+                write_tar_member(tar, f"blobs/sha256/{digest}", src=src, mode=0o644)
+        log(f"OCI 归档完成，{len(blobs)} 个 blob，开始压缩")
+        with open(tmp_out, "rb") as src, gzip.open(OCI_OUTPUT, "wb", compresslevel=6) as dst:
+            shutil.copyfileobj(src, dst, 1024 * 256)
+        os.remove(tmp_out)
+        return OCI_OUTPUT
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def verify_oci(path: str) -> bool:
+    """按 OCI 规范复检：index → manifest → config → 每层 digest 与 diff_id。"""
+    log(f"校验（OCI）{os.path.basename(path)}")
+    ok = True
+    with tarfile.open(path, "r:gz") as tar:
+        names = set(tar.getnames())
+        for required in ("oci-layout", "index.json"):
+            if required not in names:
+                log(f"  [FAIL] 缺少 {required}")
+                return False
+        layout = json.loads(tar.extractfile("oci-layout").read())
+        if layout.get("imageLayoutVersion") != "1.0.0":
+            log(f"  [FAIL] oci-layout 版本异常 {layout}")
+            ok = False
+        index = json.loads(tar.extractfile("index.json").read())
+        if not index.get("manifests"):
+            log("  [FAIL] index.json 没有 manifests")
+            return False
+        entry = index["manifests"][0]
+        man_digest = entry["digest"].split(":", 1)[1]
+        man_name = f"blobs/sha256/{man_digest}"
+        if man_name not in names:
+            log(f"  [FAIL] index 指向的 manifest 不在包里：{man_name}")
+            return False
+        man_bytes = tar.extractfile(man_name).read()
+        if hashlib.sha256(man_bytes).hexdigest() != man_digest:
+            log("  [FAIL] manifest digest 与内容不符")
+            ok = False
+        manifest = json.loads(man_bytes)
+        cfg_digest = manifest["config"]["digest"].split(":", 1)[1]
+        cfg_name = f"blobs/sha256/{cfg_digest}"
+        if cfg_name not in names:
+            log(f"  [FAIL] 缺少 config blob {cfg_name}")
+            return False
+        cfg_bytes = tar.extractfile(cfg_name).read()
+        if hashlib.sha256(cfg_bytes).hexdigest() != cfg_digest:
+            log("  [FAIL] config digest 与内容不符")
+            ok = False
+        cfg = json.loads(cfg_bytes)
+        layers = manifest["layers"]
+        diff_ids = cfg["rootfs"]["diff_ids"]
+        if len(layers) != len(diff_ids):
+            log(f"  [FAIL] layers {len(layers)} vs diff_ids {len(diff_ids)}")
+            return False
+        for i, layer in enumerate(layers):
+            d = layer["digest"].split(":", 1)[1]
+            name = f"blobs/sha256/{d}"
+            if name not in names:
+                log(f"  [FAIL] 缺少层 blob {name}")
+                ok = False
+                continue
+            blob = tar.extractfile(name).read()
+            if hashlib.sha256(blob).hexdigest() != d:
+                log(f"  [FAIL] 层 {i} 压缩后 digest 不符")
+                ok = False
+            plain = gzip.decompress(blob)
+            if "sha256:" + hashlib.sha256(plain).hexdigest() != diff_ids[i]:
+                log(f"  [FAIL] 层 {i} 解压后 diff_id 不符")
+                ok = False
+        c = cfg.get("config", {})
+        if c.get("Entrypoint") != ["python", "-m", "deepsick_attack", "bench-solve"]:
+            log(f"  [FAIL] Entrypoint 异常 {c.get('Entrypoint')}")
+            ok = False
+        if c.get("WorkingDir") != "/app":
+            log(f"  [FAIL] WorkingDir 异常 {c.get('WorkingDir')}")
+            ok = False
+        if "PYTHONPATH=/app/src" not in (c.get("Env") or []):
+            log("  [FAIL] 缺少 PYTHONPATH=/app/src")
+            ok = False
+        app_name = f"blobs/sha256/{layers[-1]['digest'].split(':', 1)[1]}"
+        with tarfile.open(fileobj=io.BytesIO(gzip.decompress(tar.extractfile(app_name).read())),
+                          mode="r:") as app:
+            members = app.getnames()
+        if not any(m.rstrip("/") == "app/src/deepsick_attack/__main__.py" for m in members):
+            log("  [FAIL] 应用层缺少 src/deepsick_attack/__main__.py")
+            ok = False
+        if any(os.path.basename(m.rstrip("/")) == ".env" for m in members):
+            log("  [FAIL] 应用层混入 .env，可能泄露密钥")
+            ok = False
+        log(f"  OCI 层数 {len(layers)}，架构 {cfg.get('architecture')}/{cfg.get('os')}")
+    log(f"  体积 {os.path.getsize(path) / 1048576:.1f} MB，sha256 {sha256_file(path)}")
+    return ok
+
 # ---------------------------------------------------------------- 校验
 
 
@@ -508,6 +724,8 @@ def verify(path: str) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="不依赖 Docker daemon 构建镜像 tar.gz")
+    parser.add_argument("--format", choices=["oci", "docker"], default="oci",
+                        help="oci: OCI Image Layout（平台托管评测要求）；docker: docker save 布局")
     parser.add_argument("--verify-only", action="store_true", help="只校验已有产物")
     parser.add_argument("--keep-cache", action="store_true", help="保留已下载的基础层")
     args = parser.parse_args()
@@ -515,23 +733,29 @@ def main() -> int:
     socket.setdefaulttimeout(60)
 
     if args.verify_only:
-        if not os.path.exists(OUTPUT):
-            log(f"产物不存在：{OUTPUT}")
+        target = OCI_OUTPUT if args.format == "oci" else OUTPUT
+        if not os.path.exists(target):
+            log(f"产物不存在：{target}")
             return 2
-        return 0 if verify(OUTPUT) else 1
+        return 0 if (verify_oci(target) if args.format == "oci" else verify(target)) else 1
 
-    log("基线：不使用 Docker daemon，直接按 Registry V2 + docker-save 布局组装")
+    log(f"基线：不使用 Docker daemon，按 Registry V2 + {'OCI Image Layout' if args.format == 'oci' else 'docker-save 布局'}组装")
     reg = pick_mirror()
     config, layer_files, base_digest = resolve_base(reg)
     log(f"基础镜像 digest {base_digest}")
 
     app_layer, app_diff_id = build_app_layer(config)
     try:
-        out = assemble(config, layer_files, app_layer, app_diff_id)
+        if args.format == "oci":
+            out = assemble_oci(config, layer_files, app_layer, app_diff_id)
+        else:
+            out = assemble(config, layer_files, app_layer, app_diff_id)
     finally:
-        os.path.exists(app_layer) and os.remove(app_layer)
+        if os.path.exists(app_layer):
+            os.remove(app_layer)
 
-    if not verify(out):
+    passed = verify_oci(out) if args.format == "oci" else verify(out)
+    if not passed:
         log("校验未通过，产物不可用")
         return 1
 

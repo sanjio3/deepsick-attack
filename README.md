@@ -101,11 +101,15 @@ python -m deepsick_attack bench-solve --solver auto
 - 动作由代码真正执行并记录观测，观测再回灌给模型，形成闭环。
 - Flag 由代码用正则从真实响应里独立提取，模型自报的 Flag 必须能在观测里找到出处才提交，找不到就拒绝。这样即使模型幻觉，也不会把编造的字符串交上去。
 
+Flag 提取分强弱两档。强特征（`flag{...}`、`CTF{...}`、`TSEC{...}` 这类明确前缀，以及 `flag-xxxxxxxx` 形式）直接采信；弱特征（任意 `xxx{...}`）必须在命中位置前后 200 字符内出现 flag 语义旁证（`flag`/`secret`/`congrat`/`答案是` 等），否则丢弃并推一条 `flag_suspect_skipped`。这一档是必需的：单用宽正则会把网页里的 JS/CSS 片段（`.cls{a:b}`、`foo{bar:2}`）当成 Flag 提交，实测出现过单题 5 次 `answer_wrong`。单题提交候选还封顶 15 条，提交次数是有成本的信号，不能无限往里灌。
+
+模型宣布收工但一条都没核验上时，本题不会立刻结束：系统把「你说的 Flag 找不到出处」作为一次观测推回去，要求继续侦察，连续两次放弃才真的收工（`solve_give_up_denied`）。原因是模型常在三四步就交白卷，白扔剩下的十几分钟预算。
+
 工具集全部基于标准库，因为 `python:3.11-slim` 里没有 nmap、curl、nc：`http_request`（带 cookie 保持）、`http_get`、`http_post`、`port_scan`、`tcp_send`（原始 TCP，用于非 HTTP 服务）、`shell`（沙箱内执行，带超时）、`decode`（base64 / hex / url / rot13）。
 
 打靶流量强制直连：工具集显式关闭代理，`shell` 也会剥掉 `*_proxy` 环境变量。否则环境里若存在出网代理，发往靶标的请求会被塞进代理，表现为 502 而不是靶标响应。
 
-上下文成本是受控的：每步只发「题面 + 最近 8 步观测」，不累积历史消息，避免 token 随步数平方增长撑爆窗口。单题受 `--challenge-seconds` 与 `--max-steps` 双重约束，整轮再受 `--total-seconds` 约束。
+上下文成本是受控的：每步只发「题面 + 最近 8 步观测」，不累积历史消息，避免 token 随步数平方增长撑爆窗口。单题受 `--challenge-seconds`（默认 780 秒）与 `--max-steps`（默认 40）双重约束，整轮再受 `--total-seconds`（默认 6300 秒）约束。单题上限取 13 分钟而不是 15 分钟，是为了给整轮留出余量——上一轮 7 道题各占满 900 秒，正好吃光 6300 秒总预算，最后一道题拿到 0 秒被直接跳过。
 
 ## 平台托管镜像
 
@@ -113,13 +117,15 @@ python -m deepsick_attack bench-solve --solver auto
 
 bash build_image.sh
 
-产出 `dist/deepsick-attack-image.tar.gz`，对应平台「上传 Agent 镜像」要求的 `.tar.gz`。平台在创建跑分任务后注入 `BENCHMARK_TOKEN` 与 `BENCHMARK_BASE_URL`；模型侧通过环境变量 `MINIMAX_API_KEY`（托管沙箱内指向网关地址）注入。
+产出 `dist/deepsick-attack-image-oci.tar.gz`，对应平台「上传 Agent 镜像」要求的 `.tar.gz`。平台在创建跑分任务后注入 `BENCHMARK_TOKEN` 与 `BENCHMARK_BASE_URL`；模型侧通过环境变量 `MINIMAX_API_KEY`（托管沙箱内指向网关地址）注入。
+
+镜像格式必须是 OCI Image Layout（`oci-layout` + `index.json` + `blobs/sha256/*`）。legacy `docker save` 的归档布局平台不认，实测报 `app_dist is not a valid OCI image archive (missing oci-layout / index.json)`。基础层直接复用镜像源里已有的 gzip blob，只把媒体类型换成 `application/vnd.oci.image.layer.v1.tar+gzip`；应用层单独压 gzip 并计算 diff_id。
 
 没有 Docker daemon 时用离线构建器，效果等价：
 
 python build_image_offline.py
 
-它按 Registry V2 协议从可访问的镜像源拉取基础层，再按 legacy `docker save` 归档布局（`manifest.json` / `<config-sha>.json` / `<layer-id>/{VERSION,json,layer.tar}` / `repositories`）组装并 gzip。构建过程自校验：每个基础层解压后的 sha256 必须等于 config 里登记的 diff_id，config 文件名必须等于其内容摘要，应用层必须包含入口且不得混入 `.env`。任一项不通过就报错退出，不产出坏镜像。
+它按 Registry V2 协议从可访问的镜像源拉取基础层（`docker.m.daocloud.io` 等国内镜像站），按 OCI 布局组装并 gzip，`--format docker` 可退回 legacy 布局做兼容验证。构建过程自校验：`oci-layout` 与 `index.json` 齐备、index→manifest→config 引用链完整、每个层压缩后 digest 与解压后 diff_id 双重核对、Entrypoint / WorkingDir / PYTHONPATH 正确、入口文件存在且没有混入 `.env`。任一项不通过就报错退出，不产出坏镜像。
 
 python build_image_offline.py --verify-only
 

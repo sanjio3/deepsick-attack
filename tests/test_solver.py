@@ -30,6 +30,9 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/secret":
             body = "<html>ok " + FLAG + "</html>"
             self.send_response(200)
+        elif self.path == "/many":
+            body = " ".join(f"flag{{bulk_{i:02d}_value}}" for i in range(20))
+            self.send_response(200)
         elif self.path == "/":
             body = "<html><a href='/secret'>files</a></html>"
             self.send_response(200)
@@ -131,6 +134,48 @@ class ExtractFlagsTest(unittest.TestCase):
 
     def test_empty(self):
         self.assertEqual(extract_flags(""), [])
+
+    def test_strict_mode_only_strong(self):
+        text = "flag{abc_123} 恭喜，答案是 secret_ab{real_one}"
+        self.assertEqual(extract_flags(text, strict=True), ["flag{abc_123}"])
+
+
+class WeakFlagGateTest(unittest.TestCase):
+    """弱特征必须带语义旁证才采信，否则会把 JS/CSS 片段当成 Flag 提交。"""
+
+    def setUp(self):
+        self.events = []
+        set_sink(self.events.append)
+
+    def tearDown(self):
+        set_sink(None)
+
+    def test_css_fragment_is_rejected(self):
+        """暗流那题实测把 .cls{a:b} 这类片段提交了 5 次，必须拦住。"""
+        self.assertEqual(extract_flags("<style>.cls{a:b}</style>"), [])
+        self.assertTrue(any(e["event"] == "flag_suspect_skipped"
+                            for e in self.events))
+
+    def test_js_object_is_rejected(self):
+        self.assertEqual(extract_flags('var x = {a:1}; foo{bar:2}'), [])
+
+    def test_weak_with_context_is_accepted(self):
+        found = extract_flags("恭喜你，答案是 secret_ab{this_is_it}")
+        self.assertEqual(found, ["secret_ab{this_is_it}"])
+        self.assertTrue(any(e["event"] == "flag_weak_accepted"
+                            for e in self.events))
+
+    def test_context_window_is_bounded(self):
+        """旁证离得太远（>200 字符）不算数。"""
+        text = "flag 出现" + "x" * 400 + " noise{abc:def}"
+        self.assertEqual(extract_flags(text), [])
+
+    def test_strong_prefix_always_accepted(self):
+        """强特征不需要旁证，哪怕整段没有任何提示词。"""
+        self.assertEqual(extract_flags("TSEC{alpha_beta}"), ["TSEC{alpha_beta}"])
+
+    def test_weak_duplicate_of_strong_not_double_counted(self):
+        self.assertEqual(extract_flags("flag{abc_123}"), ["flag{abc_123}"])
 
 
 class JsonParseTest(unittest.TestCase):
@@ -247,6 +292,48 @@ class SolveChallengeTest(unittest.TestCase):
                 llm, deadline=__import__("time").time() + 30, max_steps=4)
         self.assertEqual(flags, [FLAG])
         self.assertTrue(any(e["event"] == "solve_bad_action" for e in self.events))
+
+    def test_give_up_without_flags_does_not_end_challenge(self):
+        """模型交白卷时不能就此收工，上一轮就是这样把十几分钟预算扔掉的。"""
+        with _Server() as srv:
+            llm = FakeLLM([
+                json.dumps({"thought": "没思路，先放弃", "flags": []}),
+                json.dumps({"thought": "再看一眼", "tool": "http_get",
+                            "args": {"path": "/secret"}}),
+            ])
+            flags = solve_challenge(
+                make_challenge(),
+                StartResult("t-001", [f"http://127.0.0.1:{srv.port}"]),
+                llm, deadline=__import__("time").time() + 30, max_steps=4)
+        self.assertEqual(flags, [FLAG])
+        self.assertTrue(any(e["event"] == "solve_give_up_denied"
+                            for e in self.events))
+
+    def test_second_give_up_is_honoured(self):
+        with _Server() as srv:
+            llm = FakeLLM([
+                json.dumps({"thought": "放弃", "flags": []}),
+                json.dumps({"thought": "还是放弃", "flags": []}),
+            ])
+            flags = solve_challenge(
+                make_challenge(),
+                StartResult("t-001", [f"http://127.0.0.1:{srv.port}"]),
+                llm, deadline=__import__("time").time() + 30, max_steps=6)
+        self.assertEqual(flags, [])
+        self.assertEqual(llm.calls, 2)
+
+    def test_flag_submission_capped(self):
+        """一页 20 条候选不能全提交，提交次数要封顶。"""
+        with _Server() as srv:
+            llm = FakeLLM([
+                json.dumps({"thought": "翻目录", "tool": "http_get",
+                            "args": {"path": "/many"}}),
+            ])
+            flags = solve_challenge(
+                make_challenge(),
+                StartResult("t-001", [f"http://127.0.0.1:{srv.port}"]),
+                llm, deadline=__import__("time").time() + 30, max_steps=2)
+        self.assertEqual(len(flags), 15)
 
     def test_no_target_returns_empty(self):
         flags = solve_challenge(make_challenge(), StartResult("t-001", []), FakeLLM([]))
