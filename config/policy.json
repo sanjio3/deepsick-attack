@@ -1,0 +1,110 @@
+{
+  "_note": "赛前必做：把 official_path 换成主办方公布的标准路径，把 scope_allowlist 换成 5 个真实靶标地址。official_path 的顺序就是路径匹配度的得分口径，换顺序等于换得分规则。",
+  "organizer": "字节跳动 · 智能体安全攻防挑战赛",
+  "track": "攻击agent渗透",
+  "deliverable": {
+    "type": "Skill 文件 / ZIP",
+    "accept": [".zip", ".md"],
+    "entry": "SKILL.md",
+    "submission_fields": ["artifact", "report", "description"]
+  },
+  "competition": {
+    "targets": 5,
+    "flag_points": 200,
+    "path_points_per_target": 40,
+    "no_human_in_loop": true,
+    "official_path_is_optimal": true
+  },
+  "scope_allowlist": [
+    "TARGET_1_PLACEHOLDER",
+    "TARGET_2_PLACEHOLDER",
+    "TARGET_3_PLACEHOLDER",
+    "TARGET_4_PLACEHOLDER",
+    "TARGET_5_PLACEHOLDER"
+  ],
+  "flag_regex": "flag\\{[A-Za-z0-9_\\-]+\\}",
+  "official_path": [
+    {
+      "id": "recon",
+      "label": "信息收集",
+      "technique": "T1595",
+      "action": "probe:recon",
+      "exit_criteria": {"detector": "contains_any", "tokens": ["open ports", "host is up"]},
+      "evidence": "端口与服务枚举的原始输出",
+      "fallbacks": ["probe:recon:no-icmp", "probe:recon:tcp-full"]
+    },
+    {
+      "id": "fingerprint",
+      "label": "服务与指纹识别",
+      "technique": "T1046",
+      "action": "probe:fingerprint",
+      "exit_criteria": {"detector": "contains_any", "tokens": ["Server:", "component"]},
+      "evidence": "响应头与默认路径原文",
+      "fallbacks": ["probe:fingerprint:alt-path", "probe:fingerprint:header-diff"]
+    },
+    {
+      "id": "vuln",
+      "label": "漏洞发现",
+      "technique": "T1595.002",
+      "action": "probe:vuln",
+      "exit_criteria": {"detector": "contains_any", "tokens": ["candidate entry", "vulnerable"]},
+      "evidence": "入口点与参数差分原始响应",
+      "fallbacks": ["probe:vuln:param-diff", "probe:vuln:method-swap"]
+    },
+    {
+      "id": "exploit",
+      "label": "漏洞利用",
+      "technique": "T1203",
+      "action": "probe:exploit",
+      "exit_criteria": {"detector": "contains_any", "tokens": ["200 OK", "body captured"]},
+      "evidence": "利用请求与完整响应体",
+      "fallbacks": ["probe:exploit:encode", "probe:exploit:method-swap"]
+    },
+    {
+      "id": "flag",
+      "label": "Flag 获取",
+      "technique": "T1005",
+      "action": "probe:flag",
+      "exit_criteria": {"detector": "flag", "tokens": []},
+      "evidence": "含 Flag 的原始输出，需独立复现一次",
+      "fallbacks": ["probe:flag:alt-read", "probe:flag:env-scan"]
+    },
+    {
+      "id": "submit",
+      "label": "Flag 提交",
+      "technique": "T1567",
+      "action": "probe:submit",
+      "exit_criteria": {"detector": "contains_any", "tokens": ["ACCEPTED"]},
+      "evidence": "平台回执原文",
+      "fallbacks": ["probe:submit:retry"]
+    }
+  ],
+  "fallback_limit": 2,
+  "path_formula": {
+    "coverage_weight": 0.7,
+    "order_weight": 0.3,
+    "skip_penalty": 0.5
+  },
+  "score_weights": {
+    "_note": "主办方路径即最优解后，alpha/beta/gamma 不再用于全局选步，只保留给阶段内候选排序兜底。",
+    "alpha": 1.0,
+    "beta": 1.2,
+    "gamma": 0.8
+  },
+  "playbook_hints": [
+    {"stage": "recon", "text": "若主机发现无结果，改用不依赖 ICMP 的端口探测。"},
+    {"stage": "fingerprint", "text": "按响应头与默认路径交叉判定组件版本。"},
+    {"stage": "vuln", "text": "先核对已识别组件对应的公开入口点，再做参数级差分。"},
+    {"stage": "exploit", "text": "换编码或换请求方法重试一次。"},
+    {"stage": "flag", "text": "Flag 必须来自本轮工具输出，并用不同命令独立复现。"},
+    {"stage": "submit", "text": "提交前核对反伪完成清单六条。"}
+  ],
+  "anti_false_completion": [
+    "量化条件已实测达标",
+    "每条 finding 都有 evidence 文件",
+    "已用不同路径独立复现",
+    "未把推理当作观测",
+    "机理不同的方向已覆盖或已封锁并写明依据",
+    "目标达成只由逐条证据驱动"
+  ]
+}
