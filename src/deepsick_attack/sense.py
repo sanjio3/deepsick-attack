@@ -19,6 +19,7 @@ import re
 import socket
 import ssl
 import struct
+import urllib.error
 import urllib.request
 import time
 
@@ -425,3 +426,75 @@ def extract_secrets(text: str, limit: int = 8) -> list[str]:
         seen.add(key)
         out.append(key)
     return out[:limit]
+
+
+# 常见敏感/备份/调试路径。实跑轨迹里模型为这些路径花了二三十步，一步一个 curl；
+# 这些探测本身不带任何智力成分，应该由代码一次打完，把步数留给真正需要判断的地方。
+PROBE_PATHS = (
+    "/robots.txt", "/sitemap.xml", "/.DS_Store", "/package.json", "/composer.json",
+    "/.git/HEAD", "/.git/config", "/.env", "/.env.bak",
+    "/backup/", "/backup.zip", "/backup.sql", "/backup.tar.gz", "/db.sql",
+    "/dump.sql", "/data.sql", "/www.zip", "/www.tar.gz", "/source.zip", "/src.zip",
+    "/index.php.bak", "/index.php~", "/config.php.bak", "/config.php~",
+    "/admin", "/admin/", "/login", "/login.php", "/logout",
+    "/api/", "/api/docs", "/swagger-ui.html", "/swagger/index.html",
+    "/openapi.json", "/v2/api-docs", "/actuator", "/actuator/env",
+    "/console", "/debug", "/server-status", "/uploads/", "/files/",
+    "/flag", "/flag.txt", "/phpinfo.php", "/info.php",
+)
+
+# 这些状态码说明「路径存在」（只是没给看），比 404 更值得记。
+_ALIVE_STATUS = (200, 201, 204, 301, 302, 303, 307, 308, 401, 403, 405, 500, 503)
+
+
+def bulk_probe(base_url: str, paths: tuple[str, ...] | list[str] | None = None,
+               timeout: float = 4.0, workers: int = 12,
+               limit_bytes: int = 60_000) -> list[dict]:
+    """一次性把一批敏感路径打完，只回「有响应」的那些。
+
+    设计目标是省步数：一次动作拿到的信息量，等价于模型一步一个 curl 打几十步。
+    `status=404` 的不算命中；401/403 算命中（路径存在，只是要绕过）。
+    """
+    base = (base_url or "").rstrip("/")
+    if not base.startswith("http"):
+        return []
+    targets = list(paths or PROBE_PATHS)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def one(path: str) -> dict | None:
+        try:
+            with opener.open(base + path, timeout=timeout) as response:
+                status = getattr(response, "status", 200)
+                raw = response.read(limit_bytes)
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            try:
+                raw = exc.read(limit_bytes) or b""
+            except Exception:
+                raw = b""
+        except Exception:
+            return None
+        if status not in _ALIVE_STATUS:
+            return None
+        return {"path": path, "status": status, "length": len(raw),
+                "snippet": re.sub(r"\s+", " ", _text(raw, 240))[:120]}
+
+    hits: list[dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        for result in pool.map(one, targets):
+            if result:
+                hits.append(result)
+    hits.sort(key=lambda item: item["path"])
+    return hits
+
+
+def read_url(url: str, timeout: float = 6.0, limit_bytes: int = 200_000) -> str:
+    """取一个地址的正文。探到备份/配置文件时用它把内容捞出来。"""
+    if not url.startswith("http"):
+        return ""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=timeout) as response:
+            return _text(response.read(limit_bytes), limit_bytes)
+    except Exception:
+        return ""

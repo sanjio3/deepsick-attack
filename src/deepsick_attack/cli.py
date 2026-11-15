@@ -15,7 +15,7 @@ from . import __version__
 from .agent import run_target, self_test
 from .backends import MiniMaxLLM
 from .config import ConfigError, DEFAULT_POLICY, DEFAULT_WORKSPACE, load_policy, stage_ids
-from .events import emit
+from .events import emit, set_log_file
 from .llm import LLMConfigError, LLMError, MiniMaxClient, get_config
 from .bench_client import (
     BenchAPIError,
@@ -93,6 +93,13 @@ def build_parser() -> argparse.ArgumentParser:
                              help="跑几轮，默认取 BENCH_RETRY_PASSES 或 2；第二轮只翻打没解出来的题")
     bench_solve.add_argument("--only", default=None, metavar="CODE",
                              help="只跑题号前缀匹配的题（本地 Agent 模式单题调试，例如 a-04）")
+    bench_solve.add_argument("--log-file", default=None, metavar="PATH",
+                             help="事件流同时追加到文件，一行一个 JSON；"
+                                  "本地模式下平台不留我们的模型会话，复盘靠它")
+
+    bench_report = sub.add_parser(
+        "bench-report", help="把 --log-file 落下的 jsonl 收成按题聚合的诊断表")
+    bench_report.add_argument("--log", required=True, metavar="PATH")
 
     bench_set = sub.add_parser("bench-set", help="查看单个题集详情，无需 token")
     bench_set.add_argument("--set", required=True, metavar="SET_ID")
@@ -194,6 +201,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         emit("packed", path=str(path), bytes=path.stat().st_size)
         return 0
 
+    if args.command == "bench-report":
+        from .bench_report import render
+        print(render(args.log))
+        return 0
+
     if args.command == "bench-sets":
         try:
             sets = list_sets()
@@ -238,6 +250,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "bench-solve":
         try:
+            if args.log_file:
+                set_log_file(args.log_file)
+                emit("bench_log_file", path=args.log_file,
+                     note="事件流同时写这里，复盘直接 grep 这个文件")
             if not _vpn_preflight():
                 return 2
             solver = _select_solver(args)
@@ -250,6 +266,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (BenchConfigError, BenchConnectionError, BenchAPIError) as exc:
             emit("bench_error", detail=str(exc)[:300])
             return 1
+        finally:
+            set_log_file(None)
 
     parser.print_help()
     return 0

@@ -95,9 +95,13 @@ python -m deepsick_attack bench-solve --solver auto
 
 本地 Agent 模式下平台会签发 Token 与 Base URL，接上之后可以单题重跑：
 
-BENCHMARK_BASE_URL=https://... BENCHMARK_TOKEN=... python -m deepsick_attack bench-solve --only a-04 --passes 1
+BENCHMARK_BASE_URL=https://... BENCHMARK_TOKEN=... python -m deepsick_attack bench-solve --only a-04 --passes 1 --log-file run-a04.jsonl
 
-`--only` 按题号子串过滤，配合容器 stdout 可以直接看到这道题每一步的动作与观测。
+`--only` 按题号子串过滤，配合容器 stdout 可以直接看到这道题每一步的动作与观测。`--log-file` 把事件流同时落成 jsonl——本地模式下平台不记录我们的模型会话，复盘只能靠自己这份文件。跑完用
+
+python -m deepsick_attack bench-report --log run-a04.jsonl
+
+把几万行原始事件收成按题聚合的表：每道题用了几步、被重复拦截几次、卡住几次、试过哪些族之后失败了、拿到几个 Flag。对着这张表判断下一轮改哪里，比翻 stdout 快得多。`BENCH_VPN_REQUIRED=1` 会把 VPN 预检从告警改成硬失败。
 
 本地验证整条链路不需要真实平台：起一个模拟 Challenges API，把 `BENCHMARK_BASE_URL` 指向它、`BENCHMARK_TOKEN` 填对应值即可跑通 list → start → 解题 → submit → close。
 

@@ -83,7 +83,12 @@ vi 等一整套）。所以你不需要「请求某个接口」，你**直接跑
 操作要点：
 - 先摸清服务再打。开场侦察已经由代码跑过一遍，结果就在上面的观测里；平台给的端口
   没响应时，先按「邻近端口」扫（`-p 4990-5010`），**不要用 `nmap -p-`**：全量扫一轮
-  几十秒到几分钟，40 步预算经不起，一次就能吃掉三分之一。
+  几十秒到几分钟，90 步预算经不起，一次就能吃掉三分之一。
+- **步数按命令算，不按请求算。** 这是最省时间的一条：同类试探必须一条命令打完，
+  不要一条命令打一个点。`for p in api/login api/user api/admin; do echo -n "$p ";
+  curl -s -o /dev/null -w "%{http_code} %{size_download}\n" -m 5 http://HOST:PORT/$p;
+  done`，一条命令 20 个路径，等价于 20 步。带参数的 fuzz 同理，把 payload 列在 for 循环里，
+  只打印状态码和长度，看哪一行不一样。响应很长时用 `-o /dev/null -w` 只看码和长度。
 - 每条命令都必须在 20 秒内出结果。给 nmap 加 `--host-timeout 20s -T4`，给 curl 加
   `-m 8`。跑满超时的命令等于白扔一步。
 - HTTP 用 `curl -i -sS -m 10 http://HOST:PORT/路径`，别用 -o /dev/null，要看响应头。
@@ -93,6 +98,10 @@ vi 等一整套）。所以你不需要「请求某个接口」，你**直接跑
 - 要发反弹 shell、传文件、跑 python 脚本，一律走会话：先 start，再 send，再 read。
 - 命令输出很长时自己用 head/grep/cut 收口，不要把几万行原始输出打出来。
 - 看到形如 xxx{...} 的可疑串立刻交卷，不要反复确认——平台会给对错反馈。
+- **失败要换族，不是换写法。** 某个端点上试过上传绕过、失败；试过 SQL 注入、失败；
+  试过 SSRF、失败——那就换另一族（越权 id / 路径穿越 / 模板注入 / 反序列化），
+  不要在同一族里改写同一条 payload（把 python 改写成 curl 不算换思路）。
+  提示词里有「已排除」清单，同族在这个路径上失败过就不要再试。
 - 同一个命令不要重复跑；连续两次没进展就换思路（换协议、换端口、换路径、换角度）。
 - 响应里出现「检测到 / blocked / 已被记录 / 蜜罐」这类话术，立刻停手这条线，
   换个入口，别硬刚。"""
@@ -128,6 +137,10 @@ class SolveContext:
     # 记一层，同一组 URL 抓第三次就拦。
     url_seen: dict[str, int] = field(default_factory=dict)
     url_cache: dict[str, str] = field(default_factory=dict)
+    # 「某族载荷在某路径上已经失败过」。字面去重挡不住「同一族换写法重试」
+    # （a-04 那题在一个 403 入口上换了 8 种 python 写法），但把结论摆到提示词里，
+    # 模型换族的概率明显更高。这里是知识而不是闸门，只提示不拦截。
+    excluded: dict[str, int] = field(default_factory=dict)
 
 
 def parse_targets(container_addr: list[str]) -> tuple[str, list[int]]:
@@ -226,6 +239,52 @@ def _url_signature(command: str) -> str:
     """命令里出现的 URL 集合。空集合表示这条命令不是在抓某个固定地址。"""
     urls = sorted({m.group(0).rstrip(".,;") for m in URL_RE.finditer(command or "")})
     return "|".join(urls)
+
+
+# 攻击族标记。用于把「同一族载荷在同一目标上失败了」记成一条排除项——
+# 字面去重拦不住「同一族换写法」，但把结论写进提示词就能让模型自己换族。
+ATTACK_FAMILIES = (
+    ("上传绕过", ("multipart", "filename=", "upload", ".php.jpg", "\\.phtml")),
+    ("SSRF", ("target_url", "url=", "169.254.169.254", "file://", "gopher://",
+              "dict://", "localhost:", "0.0.0.0:")),
+    ("路径穿越", ("\\.\\./", "%2e%2e", "/etc/passwd", "..%2f", "win.ini")),
+    ("SQL 注入", ("union select", "or 1=1", "' or '", "sleep(", "sqlmap",
+                  "information_schema")),
+    ("SSTI", ("{{", "${", "<%=", "%7b%7b")),
+    ("命令注入", (";id", "|id", "`id", "$(", "&&id", ";cat ", "|cat ")),
+    ("越权 id", ("id=1", "id=2", "user_id=", "uid=", "?id=")),
+    ("反序列化", ("ro0ab", "aced0005", "unserialize", "pickle", "ysoserial")),
+    ("XXE", ("<!doctype", "<!entity", "xmlns:")),
+)
+
+_FAILURE_RE = re.compile(
+    r"(?i)(403 forbidden|401 unauthorized|\b404\b|access denied|invalid (?:api )?key|"
+    r"permission denied|not allowed|forbidden|unauthorized|no such file|"
+    r"invalid parameter|参数错误|无权|禁止|未授权)")
+
+
+def _attack_family(command: str) -> tuple[str, str]:
+    """判断一条命令在试哪一族漏洞、打哪个路径。判断不出就返回空串。"""
+    low = (command or "").lower()
+    family = ""
+    for name, markers in ATTACK_FAMILIES:
+        if any(marker in low for marker in markers):
+            family = name
+            break
+    if not family:
+        return "", ""
+    match = URL_RE.search(command or "")
+    path = ""
+    if match:
+        try:
+            path = urllib.parse.urlsplit(match.group(0)).path or "/"
+        except ValueError:
+            path = ""
+    return family, path
+
+
+def _looks_failed(output: str) -> bool:
+    return bool(_FAILURE_RE.search(output or ""))
 
 
 def _kill_tree(proc: "subprocess.Popen[str] | None") -> None:
@@ -766,6 +825,44 @@ def recon_scan(context: SolveContext, board: FactBoard,
                 board.add(Fact("credential", f"secret:{item}",
                                f"前端 JS 里出现 {item}", "high"))
 
+        # 敏感路径批量探测：这一批在旧实现里是模型一步一个 curl 打的，实测吃掉
+        # 二三十步。它们的判定完全确定（存在/不存在），交给代码跑，命中结果直接
+        # 进事实板——同样一份信息，步数成本从二十几步降到 0。
+        hits = sense.bulk_probe(context.base_url)
+        if emit_events:
+            emit("recon_probe", base=context.base_url, probed=len(sense.PROBE_PATHS),
+                 hits=len(hits))
+        if hits:
+            lines.append(f" 敏感路径命中 {len(hits)} 个：" + ", ".join(
+                f"{h['path']}({h['status']})" for h in hits[:14]))
+            for hit in hits[:14]:
+                alive = hit["status"] not in (200, 201, 204)
+                board.add(Fact("route", f"probe:{hit['path']}",
+                               f"{context.base_url.rstrip('/')}{hit['path']} → "
+                               f"{hit['status']} {hit['snippet'][:80]}",
+                               "low" if alive else "high"))
+            # 备份 / 源码 / 配置类命中往往直接带凭据甚至 Flag，先把内容捞出来。
+            # 抓到的正文原样并进侦察文本，由调用方统一做 Flag 提取与入库。
+            leaked = 0
+            for hit in hits:
+                if leaked >= 2:
+                    break
+                if not any(k in hit["path"] for k in
+                           ("backup", "sql", "zip", "bak", ".env", "config")):
+                    continue
+                body = sense.read_url(context.base_url.rstrip("/") + hit["path"])
+                if not body:
+                    continue
+                leaked += 1
+                lines.append(f"  下载 {hit['path']}（{len(body)} 字符）正文片段：\n"
+                             + body[:1200])
+                if re.search(r"(?i)(passwd|password|secret|token|api[_-]?key)", body):
+                    board.add(Fact("artifact", f"leak:{hit['path']}",
+                                   f"{hit['path']} 内含凭据线索", "high"))
+                for cred in sense.extract_secrets(body)[:4]:
+                    board.add(Fact("credential", f"secret:{cred}",
+                                   f"{hit['path']} 里出现 {cred}", "high"))
+
     # mDNS：动态靶标常用它公布真实端点
     if 5353 in open_ports or not open_ports:
         names = sense.mdns_services()
@@ -829,6 +926,10 @@ def _build_pick_prompt(challenge: Challenge, context: SolveContext) -> str:
     if context.attempts:
         lines += ["", "## 已经跑过的动作（**不要再跑一遍**，输出就在下面摘要里）"]
         lines += context.attempts[-14:]
+    if context.excluded:
+        tried = sorted(context.excluded.items(), key=lambda kv: -kv[1])[:10]
+        lines += ["", "## 已排除（这些族在对应路径上失败过，换族而不是换写法）"]
+        lines += [f"- {key}（FAILED {count} 次）" for key, count in tried]
 
     recent = context.observations[-3:]
     if recent:
@@ -986,7 +1087,22 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
         if not action:
             emit("solve_bad_action", unique_code=challenge.unique_code, step=step,
                  raw=text[:200])
-            continue
+            # 输出不成 JSON 不该算掉一步：拿同样的上下文再要一次，只把「只输出
+            # 一个 JSON」这句话加在末尾。第二次还是不行才丢掉这一步。
+            retry_prompt = prompt + ("\n\n上一轮的输出不是合法 JSON。只输出一个 JSON "
+                                     "对象，不要任何其它文字、不要代码块标记。")
+            try:
+                again = client.complete(
+                    SYSTEM_PROMPT, messages=[{"role": "user", "content": retry_prompt}])
+                action = _extract_json_object((again or {}).get("text") or "")
+            except Exception as exc:  # noqa: BLE001
+                emit("solve_llm_error", unique_code=challenge.unique_code, step=step,
+                     attempt="json-retry", detail=f"{type(exc).__name__}: {exc}"[:200])
+                action = None
+            if not action:
+                emit("solve_bad_action_giveup", unique_code=challenge.unique_code,
+                     step=step, note="重问一次仍不是 JSON，丢掉这一步")
+                continue
 
         thought = str(action.get("thought") or action.get("why") or "")[:300]
 
@@ -1086,6 +1202,16 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
                 summary = output.replace("\n", " ")[:110]
                 context.attempts.append(
                     f"- 第{step}步 {tool} `{signature.split(':', 1)[1][:90]}` → {summary}")
+                # 这一族在这个路径上失败了就记一条，下一轮提示词里会点名。
+                family, path = _attack_family(raw_command)
+                if family and _looks_failed(output) and not extract_flags(output):
+                    key = f"{family} @ {path or '(未指明路径)'}"
+                    fresh = key not in context.excluded
+                    context.excluded[key] = context.excluded.get(key, 0) + 1
+                    if fresh:
+                        emit("solve_excluded", unique_code=challenge.unique_code,
+                             step=step, key=key,
+                             note="这一族在这个路径上失败，下一轮提示词里会点名")
         context.observations.append(
             Observation(step, tool, call_args, output, elapsed, thought))
         emit("solve_step", unique_code=challenge.unique_code, step=step, tool=tool,

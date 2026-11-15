@@ -23,6 +23,7 @@ from deepsick_attack.solver import (
     SolveContext,
     Toolkit,
     _extract_json_object,
+    _attack_family,
     _choose_base_url,
     parse_targets,
     recon_scan,
@@ -744,6 +745,101 @@ class AcceptsSubmitTest(unittest.TestCase):
 
     def test_detects_kwargs(self):
         self.assertTrue(_accepts_submit(lambda a, b, **kw: None))
+
+
+class BulkProbeTest(unittest.TestCase):
+    """敏感路径探测从「模型一步步试」改成「代码一次打完」。
+
+    实跑轨迹里模型为 /backup/、/robots.txt、/.git/HEAD 这类路径花了二三十步，
+    每步一个 curl。这些判定完全确定，不该占模型步数。
+    """
+
+    def test_reports_only_paths_that_exist(self):
+        with _Server() as srv:
+            hits = sense.bulk_probe(f"http://127.0.0.1:{srv.port}",
+                                    ["/secret", "/definitely-not-here"])
+        self.assertEqual([h["path"] for h in hits], ["/secret"])
+        self.assertEqual(hits[0]["status"], 200)
+
+    def test_forbidden_counts_as_alive(self):
+        """403 说明路径存在，只是要绕过——不能当没命中丢掉。"""
+        with _Server() as srv:
+            hits = sense.bulk_probe(f"http://127.0.0.1:{srv.port}", ["/trap"])
+        self.assertEqual([(h["path"], h["status"]) for h in hits], [("/trap", 403)])
+
+    def test_bad_base_url_is_a_noop(self):
+        self.assertEqual(sense.bulk_probe(""), [])
+
+    def test_recon_folds_probe_hits_into_facts_and_text(self):
+        from unittest import mock
+        with _Server() as srv:
+            board = _board("127.0.0.1")
+            ctx = SolveContext(host="127.0.0.1", hint_ports=[srv.port],
+                               board=board)
+            with mock.patch.object(sense, "PROBE_PATHS",
+                                   ("/secret", "/definitely-not-here")):
+                text = recon_scan(ctx, board, emit_events=False)
+            keys = [f.key for f in board.of("route")]
+        self.assertIn("敏感路径命中", text)
+        self.assertIn("probe:/secret", keys)
+        self.assertNotIn("probe:/definitely-not-here", keys)
+
+
+class AttackFamilyTest(unittest.TestCase):
+    """失败要记成「某族 @ 某路径」，让下一轮提示词能点名，模型才会换族。"""
+
+    def test_upload_family_and_path(self):
+        self.assertEqual(
+            _attack_family("curl -F 'f=@a.png;filename=a.php' http://h:80/upload.php"),
+            ("上传绕过", "/upload.php"))
+
+    def test_idor_family(self):
+        self.assertEqual(_attack_family("curl -s 'http://h/order?id=2'"), ("越权 id", "/order"))
+
+    def test_plain_recon_has_no_family(self):
+        self.assertEqual(_attack_family("curl -sS http://h:80/"), ("", ""))
+
+    def test_failed_family_is_named_in_next_prompt(self):
+        with _Server() as srv:
+            llm = FakeLLM([
+                json.dumps({"cmd": f"curl -sS -i -m 5 'http://127.0.0.1:{srv.port}/trap?id=2'"}),
+                json.dumps({"cmd": "echo second"}),
+            ])
+            solve_challenge(make_challenge(),
+                            StartResult("t-001", [f"127.0.0.1:{srv.port}"]),
+                            llm, deadline=time.time() + 30, max_steps=2)
+        self.assertTrue(any("已排除" in p and "越权 id" in p for p in llm.prompts),
+                        f"提示词里没有点名已排除的攻击族：{llm.prompts[-1][:600]}")
+
+
+class BadActionRetryTest(unittest.TestCase):
+    """输出不是 JSON 不该算掉一步：重问一次，第二次才认输。"""
+
+    def setUp(self):
+        self.events = []
+        set_sink(self.events.append)
+
+    def tearDown(self):
+        set_sink(None)
+
+    def test_retry_recovers_without_spending_a_step(self):
+        llm = FakeLLM([
+            "我想先看看首页，然后再决定。",            # 第 1 步：不是 JSON
+            json.dumps({"cmd": "echo recovered"}),      # 重问：合法 JSON
+        ])
+        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
+                        llm, deadline=time.time() + 30, max_steps=1)
+        self.assertEqual(llm.calls, 2)
+        self.assertTrue(any(e["event"] == "solve_bad_action" for e in self.events))
+        self.assertFalse(any(e["event"] == "solve_bad_action_giveup"
+                             for e in self.events))
+
+    def test_gives_up_after_second_failure(self):
+        llm = FakeLLM(["不是 JSON", "还不是 JSON"])
+        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
+                        llm, deadline=time.time() + 30, max_steps=1)
+        self.assertTrue(any(e["event"] == "solve_bad_action_giveup"
+                            for e in self.events))
 
 
 if __name__ == "__main__":
