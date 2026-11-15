@@ -77,15 +77,17 @@ class MiniMaxClient:
         self.config = config or get_config()
         self.timeout = timeout
 
-    def complete(self, system: str, user: str,
+    def complete(self, system: str, user: str = "",
                  max_tokens: int | None = None,
-                 effort: str | None = None) -> dict[str, Any]:
+                 effort: str | None = None,
+                 messages: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """单轮或多轮补全。给出 messages 时忽略 user，用于多步工具调用的上下文累积。"""
         payload = {
             "model": self.config["model"],
             "max_tokens": max_tokens or self.config["max_tokens"],
             "output_config": {"effort": effort or self.config["effort"]},
             "system": system,
-            "messages": [{"role": "user", "content": user}],
+            "messages": messages or [{"role": "user", "content": user}],
         }
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(

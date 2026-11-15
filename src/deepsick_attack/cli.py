@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from typing import Sequence
 
@@ -55,7 +56,17 @@ def build_parser() -> argparse.ArgumentParser:
     pack.add_argument("--out", default=None)
 
     sub.add_parser("bench-sets", help="列出 TSecBench 公开题集，无需 token")
-    sub.add_parser("bench-solve", help="按平台官方协议跑一轮答题流程，需 BENCHMARK_* 环境变量")
+    bench_solve = sub.add_parser(
+        "bench-solve", help="按平台官方协议跑一轮答题流程，需 BENCHMARK_* 环境变量")
+    bench_solve.add_argument(
+        "--solver", choices=["auto", "llm", "stub"], default="auto",
+        help="auto: 有模型凭据用真实解题器，否则退回占位器（不提交任何 Flag）")
+    bench_solve.add_argument("--max-steps", type=int, default=None,
+                             help="单题最大动作步数，默认取 BENCH_MAX_STEPS 或 12")
+    bench_solve.add_argument("--total-seconds", type=int, default=None,
+                             help="整轮总时间预算，默认取 BENCH_TOTAL_SECONDS 或 6000")
+    bench_solve.add_argument("--challenge-seconds", type=int, default=None,
+                             help="单题时间预算，默认取 BENCH_CHALLENGE_SECONDS 或 480")
 
     bench_set = sub.add_parser("bench-set", help="查看单个题集详情，无需 token")
     bench_set.add_argument("--set", required=True, metavar="SET_ID")
@@ -65,6 +76,39 @@ def build_parser() -> argparse.ArgumentParser:
     bench_run.add_argument("--agent-id", default=None)
     bench_run.add_argument("--base-model", default=None)
     return parser
+
+
+def _select_solver(args):
+    """按 --solver 选解题器。auto 模式下缺凭据就退回占位器，绝不假装能答题。"""
+    from .bench_client import stub_solver
+    from .solver import make_llm_solver
+
+    if getattr(args, "challenge_seconds", None):
+        os.environ["BENCH_CHALLENGE_SECONDS"] = str(args.challenge_seconds)
+    if getattr(args, "max_steps", None):
+        os.environ["BENCH_MAX_STEPS"] = str(args.max_steps)
+
+    if args.solver == "stub":
+        emit("solver_selected", solver="stub", note="占位器不产出任何 Flag")
+        return stub_solver
+    if args.solver == "llm":
+        return make_llm_solver(
+            max_steps=args.max_steps,
+            total_seconds=args.total_seconds,
+            shell_timeout=int(os.environ.get("BENCH_SHELL_TIMEOUT", "30")),
+        )
+    # auto
+    try:
+        get_config()
+    except LLMConfigError as exc:
+        emit("solver_selected", solver="stub",
+             note=f"未配置模型凭据，退回占位器（本轮不会提交 Flag）：{exc}")
+        return stub_solver
+    return make_llm_solver(
+        max_steps=args.max_steps,
+        total_seconds=args.total_seconds,
+        shell_timeout=int(os.environ.get("BENCH_SHELL_TIMEOUT", "30")),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -161,7 +205,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "bench-solve":
         try:
-            summary = run_benchmark()
+            solver = _select_solver(args)
+            summary = run_benchmark(solver=solver)
             emit("bench_done", **summary)
             return 0
         except (BenchConfigError, BenchConnectionError, BenchAPIError) as exc:
