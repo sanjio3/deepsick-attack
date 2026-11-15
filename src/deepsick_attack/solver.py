@@ -33,7 +33,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import sense
+from . import graph_exec, sense
+from .attack_graph import AttackGraph, Entry, extract_entries
 from .bench_client import Challenge, StartResult
 from .events import emit
 from .facts import Fact, FactBoard
@@ -50,6 +51,8 @@ MIN_ACTION_GAP = 0.9
 JITTER = 0.7
 # 连续撞到这么多次主动防御话术就熔断该题，避免把「死手」这类题的自毁机制踩爆。
 TRIPWIRE_BREAKER = 3
+# 图上的边全打空后，最多自动回到侦察几轮。再多就是真的没牌了，该交给模型。
+MAX_RECON_ROUNDS = 3
 # 连续多少步没有新事实就放弃这道题
 STALE_ABANDON = 25
 BANNER_CLIP = 700
@@ -62,7 +65,7 @@ SSH_CREDS = [
     ("msfadmin", "msfadmin"), ("user", "user"), ("guest", "guest"),
 ]
 
-SYSTEM_PROMPT = """你是一台攻击机上的授权 CTF 操作员。你在一个隔离沙箱里，可以直接跑命令。
+SYSTEM_PROMPT = r"""你是一台攻击机上的授权 CTF 操作员。你在一个隔离沙箱里，可以直接跑命令。
 
 攻击机上装了：bash、python3、nmap、curl、ncat、socat、busybox（busybox 里带 nc/wget/
 vi 等一整套）。所以你不需要「请求某个接口」，你**直接跑命令**。
@@ -74,7 +77,7 @@ vi 等一整套）。所以你不需要「请求某个接口」，你**直接跑
 2. 起一个持久会话（ssh / nc / python 这类要交互的）：
 {"session": "start", "cmd": "python3 -i", "why": "要交互"}
 3. 往已有会话发东西 / 读出来：
-{"session": "send", "id": 1, "text": "id; ls -la /\\n"}
+{"session": "send", "id": 1, "text": "id; ls -la /\n"}
 {"session": "read", "id": 1, "wait": 3}
 {"session": "list"}  {"session": "kill", "id": 1}
 4. 拿到了 Flag 就交卷：
@@ -180,6 +183,8 @@ class SolveContext:
     # 平台官方提示。这东西直接指出漏洞类型和命中位置，价值远高于模型自己猜，
     # 所以开局就取、每轮都放在提示词靠前位置，而不是等撞墙了才去找。
     hint: str = ""
+    # 攻击图。决策的骨架在这里，不在提示词里。
+    graph: AttackGraph | None = None
 
 
 def parse_targets(container_addr: list[str]) -> tuple[str, list[int]]:
@@ -1005,6 +1010,14 @@ def _build_pick_prompt(challenge: Challenge, context: SolveContext) -> str:
         "## 事实板（代码已核实的观测结论）",
         board.snapshot() if board else "（空）",
         "",
+    ]
+    if context.graph is not None:
+        lines += [
+            "## 攻击图（下一步该打哪里由它决定，待验证边会被代码自动执行）",
+            context.graph.snapshot(),
+            "",
+        ]
+    lines += [
         "## 会话",
         context.sessions_text or "（没有活跃会话）",
         "",
@@ -1158,6 +1171,17 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
             emit("solve_hint", unique_code=challenge.unique_code, hint=text[:300],
                  step=0)
 
+    # ---- 初始化攻击图 ----
+    # 侦察文本里可能已经带了入口（首页 HTML、路由列表），先灌进去。
+    # 没有也没关系：模型跑第一条 curl 之后，输出里的链接会被立刻抽成节点。
+    graph = AttackGraph()
+    context.graph = graph
+    seed_entries = extract_entries(recon_text)
+    if seed_entries:
+        added = graph.add_entries(seed_entries)
+        emit("solve_graph_seed", unique_code=challenge.unique_code,
+             new_entries=len(added), **graph.stats())
+
     # ---- 阶段二：命令/会话循环 ----
     last_tool = ""
     repeat = 0
@@ -1165,6 +1189,7 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
     blocked_streak = 0
     facts_seen = board.stats()["facts"]
     stale = 0
+    recon_rounds = 0
     for step in range(1, steps + 1):
         if time.time() >= deadline:
             emit("solve_timeout", unique_code=challenge.unique_code, step=step)
@@ -1175,6 +1200,86 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
             emit("solve_breaker", unique_code=challenge.unique_code, step=step,
                  note=f"连续 {tripwires} 次命中主动防御话术，本题熔断")
             break
+
+        # ---- 图驱动：图上有能确定性执行的待验证边，这一步就不问模型 ----
+        # 这是整个改动的核心。旧实现每步都让模型在一个无限动作空间里挑，
+        # 于是「已经拿到 file_read 却回头枚举 admin 接口」这类空转必然发生。
+        # 现在只要图里还有边，代码就按优先级自己打；模型只在图耗尽时补位。
+        edge, command = None, ""
+        if context.base_url:
+            for _ in range(8):
+                candidate_edge = graph.next_edge()
+                if candidate_edge is None:
+                    break
+                rendered = graph_exec.render(candidate_edge, context.base_url)
+                if rendered is None:
+                    # 这条边没有确定性打法（上传绕过要构造文件），关掉交给模型
+                    graph.close(candidate_edge)
+                    continue
+                edge, command = candidate_edge, rendered
+                break
+            if edge is None and recon_rounds < MAX_RECON_ROUNDS:
+                # 图上的边全打空了：回到侦察，长一批新入口。这是图的自愈，
+                # 也是它和「一次性清单」的区别——不会停在原地重复同一条命令。
+                edge = graph.ensure_recon()
+                command = graph_exec.render(edge, context.base_url)
+                if command:
+                    recon_rounds += 1
+
+        if edge is not None and command:
+            started_at = time.time()
+            output = toolkit.run("shell", {"command": command})
+            elapsed = time.time() - started_at
+            verdict = graph_exec.judge(edge, output)
+            edge.attempts += 1
+
+            if verdict["state"] == "worked":
+                graph.mark_worked(edge)
+            elif verdict["state"] == "auth_required":
+                # 打不通是因为没登录。标成 denied，登录成功后 add_capability("auth")
+                # 会把这条边重新变成 pending，而不是当成「这个族不存在」。
+                if edge.entry is not None:
+                    edge.entry.auth = "denied"
+                graph.close(edge)
+            else:
+                graph.close(edge)
+            for kind, via, detail in verdict["caps"]:
+                graph.add_capability(kind, via, detail)
+
+            # 输出里新出现的链接/表单立刻入图，这是图能自举的关键：
+            # 一条 curl 拿到的页面，下一步就变成若干条待验证边。
+            fresh_entries = graph.add_entries(extract_entries(output))
+
+            where = edge.entry.key if edge.entry else "global"
+            context.observations.append(Observation(
+                step, f"graph:{edge.family}", {"command": command},
+                output, elapsed, edge.why))
+            emit("solve_step", unique_code=challenge.unique_code, step=step,
+                 tool="shell", thought=f"[图] {edge.family} @ {where} — {edge.why}",
+                 args=json.dumps({"command": command}, ensure_ascii=False)[:200],
+                 output=output[:400], elapsed=round(elapsed, 2),
+                 facts=board.stats()["facts"])
+            emit("solve_graph_edge", unique_code=challenge.unique_code, step=step,
+                 family=edge.family, target=where, state=verdict["state"],
+                 note=(verdict["note"] or "")[:120],
+                 new_entries=len(fresh_entries), **graph.stats())
+
+            for flag in verdict["flags"] + extract_flags(output):
+                submit_flag(flag, step, f"图驱动 {edge.family}")
+            if len(verified) >= max(1, challenge.flag_count or 1):
+                break
+
+            # 图有实质进展才算没卡住：边成功、需要登录（等会话）、拿到新入口或能力
+            if (verdict["state"] in ("worked", "auth_required")
+                    or fresh_entries or verdict["caps"]):
+                stale = 0
+            else:
+                stale += 1
+            if stale >= STALE_ABANDON:
+                emit("solve_abandon", unique_code=challenge.unique_code, step=step,
+                     stale=stale, note="图上的待验证边都打空了，提前收手")
+                break
+            continue
 
         context.sessions_text = toolkit.session_list()
         prompt = _build_pick_prompt(challenge, context)
@@ -1337,6 +1442,11 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
                         emit("solve_excluded", unique_code=challenge.unique_code,
                              step=step, key=key,
                              note="这一族在这个路径上失败，下一轮提示词里会点名")
+                # 模型自己跑出来的页面同样要入图：一个 href 带查询串就是一条待验证边。
+                new_entries = graph.add_entries(extract_entries(output))
+                if new_entries:
+                    emit("solve_graph_grow", unique_code=challenge.unique_code,
+                         step=step, new_entries=len(new_entries), **graph.stats())
         context.observations.append(
             Observation(step, tool, call_args, output, elapsed, thought))
         emit("solve_step", unique_code=challenge.unique_code, step=step, tool=tool,
