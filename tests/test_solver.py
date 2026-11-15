@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import json
 import threading
 import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from deepsick_attack.bench_client import Challenge, StartResult
@@ -171,6 +172,20 @@ class ToolkitTest(unittest.TestCase):
         ctx = SolveContext(base_url="http://x", host="x")
         self.assertIn("flag{a}", Toolkit(ctx).run(
             "decode", {"value": "ZmxhZ3thfQ==", "kind": "base64"}))
+
+    def test_no_proxy_env_disables_fallback(self):
+        """环境里没配代理时不应构造代理通道，避免每次失败都白重试一轮。"""
+        ctx = SolveContext(base_url="http://127.0.0.1:1", host="127.0.0.1")
+        toolkit = Toolkit(ctx)
+        with patch("urllib.request.getproxies", return_value={}):
+            self.assertIsNone(toolkit._env_proxy_opener())
+
+    def test_direct_failure_reports_error_not_raise(self):
+        ctx = SolveContext(base_url="http://127.0.0.1:1", host="127.0.0.1")
+        toolkit = Toolkit(ctx, http_timeout=2)
+        with patch("urllib.request.getproxies", return_value={}):
+            out = toolkit.run("http_get", {"path": "/"})
+        self.assertTrue("请求失败" in out or "HTTP" in out)
 
 
 class SolveChallengeTest(unittest.TestCase):

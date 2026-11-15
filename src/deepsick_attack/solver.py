@@ -127,6 +127,7 @@ class Toolkit:
             urllib.request.ProxyHandler({}),
             urllib.request.HTTPCookieProcessor(context.jar),
         )
+        self._env_opener = None  # 懒加载；False 表示环境没配代理，不再尝试
 
     # -- 内部 ------------------------------------------------------
 
@@ -151,24 +152,46 @@ class Toolkit:
                      headers: dict | None = None, body: str = "") -> str:
         url = self._absolute(path)
         data = body.encode("utf-8") if body else None
-        request = urllib.request.Request(
-            url, data=data, method=str(method or "GET").upper(),
-            headers={str(k): str(v) for k, v in (headers or {}).items()},
-        )
-        try:
-            with self._opener.open(request, timeout=self.http_timeout) as response:
-                raw = response.read()
-                text = raw.decode("utf-8", errors="replace")
+        verb = str(method or "GET").upper()
+        hdrs = {str(k): str(v) for k, v in (headers or {}).items()}
+
+        def send(opener) -> str:
+            request = urllib.request.Request(url, data=data, method=verb, headers=hdrs)
+            with opener.open(request, timeout=self.http_timeout) as response:
+                text = response.read().decode("utf-8", errors="replace")
                 head = "\n".join(f"{k}: {v}" for k, v in response.headers.items())
-                return self._clip(
-                    f"HTTP {response.status} {url}\n{head}\n\n{text}"
-                )
+                return self._clip(f"HTTP {response.status} {url}\n{head}\n\n{text}")
+
+        try:
+            return send(self._opener)
         except urllib.error.HTTPError as exc:
             text = exc.read().decode("utf-8", errors="replace")
             head = "\n".join(f"{k}: {v}" for k, v in exc.headers.items())
             return self._clip(f"HTTP {exc.code} {url}\n{head}\n\n{text}")
         except Exception as exc:  # 网络层失败也算观测，不中断循环
+            # 直连不通时再试环境代理：某些沙箱只允许经代理访问靶标容器。
+            alt = self._env_proxy_opener()
+            if alt is not None:
+                try:
+                    return "[直连失败，已改走环境代理]\n" + send(alt)
+                except Exception:
+                    pass
             return f"请求失败 {url}: {type(exc).__name__}: {exc}"
+
+    def _env_proxy_opener(self):
+        """懒加载代理通道。环境里没配代理就返回 None，避免无谓重试。"""
+        if self._env_opener is False:
+            return None
+        if self._env_opener is None:
+            proxies = urllib.request.getproxies()
+            if not proxies:
+                self._env_opener = False
+                return None
+            self._env_opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler(proxies),
+                urllib.request.HTTPCookieProcessor(self.context.jar),
+            )
+        return self._env_opener
 
     def http_get(self, path: str = "/", headers: dict | None = None) -> str:
         return self.http_request("GET", path, headers)
