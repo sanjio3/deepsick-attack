@@ -24,3 +24,8 @@ config/*.local.json
 
 # vendor 依赖：轮子入库（构建输入，7MB），解包产物不入库（由 install_vendor.py 生成）
 vendor/site-packages/
+
+# 跑分产物与凭据，不入库
+logs/
+*.ovpn
+.tools_py/

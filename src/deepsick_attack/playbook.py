@@ -161,7 +161,12 @@ def propose(board, max_items: int = 8) -> list[Candidate]:
                               "mdns", {}, "动态防御类靶标靠 mDNS 暴露真实端口"))
         return pool[:max_items]
 
-    for fact in services:
+    # 平台给的那一个端口才是本题入口；同一宿主机上还挂着别的题。候选只取前 8 条，
+    # 若按端口号排序，本题入口会被 18300 这类邻居端口挤掉——模型于是去打别人的题。
+    primary = {f.key.rsplit(":", 1)[-1] for f in board.of("entry")}
+    ordered = sorted(services, key=lambda f: (f.key.rsplit(":", 1)[-1] not in primary,))
+
+    for fact in ordered:
         port = fact.key.rsplit(":", 1)[-1]
         try:
             port_no = int(port)

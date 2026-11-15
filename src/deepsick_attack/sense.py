@@ -409,11 +409,17 @@ def fetch_assets(base_url: str, html: str, timeout: float = 5.0,
 
 
 _SECRET_RE = re.compile(
-    r"""(?i)["']?([A-Za-z0-9_\-]{0,20}(?:api[_-]?key|apikey|x-api-key|secret|token|passwd|password)[A-Za-z0-9_\-]{0,10})["']?\s*[:=]\s*["']([^"'\s]{4,64})["']""")
+    r"""(?i)["']?([A-Za-z0-9_\-]{0,20}(?:api[_-]?key|apikey|secret|token|passwd|password)[A-Za-z0-9_\-]{0,10})["']?\]?\s*[:=,]\s*["']([^"'\s]{4,80})["']""")
 
 
 def extract_secrets(text: str, limit: int = 8) -> list[str]:
-    """从前端 JS 里捞硬编码凭据。a-04 的 key 就是从前端包里挖出来的。"""
+    """从前端 JS 里捞硬编码凭据。
+
+    真实靶标里凭据至少有两种写法，两种都要认：
+        headers['X-API-Key'] = 'cms_int_svc_xxx'
+        formData.append('api_key', 'cms_int_svc_xxx')
+    只认 `key: value` / `key = value` 会两个都漏（a-04 实测返回 0 条）。
+    """
     out: list[str] = []
     seen: set[str] = set()
     for m in _SECRET_RE.finditer(text or ""):
@@ -425,6 +431,33 @@ def extract_secrets(text: str, limit: int = 8) -> list[str]:
             continue
         seen.add(key)
         out.append(key)
+    return out[:limit]
+
+
+def combine_routes(routes: list[str], limit: int = 24) -> list[str]:
+    """把「基址 + 相对路由」拼成真实路径。
+
+    前端常见 `apiBase: '/api'` 然后 `fetch(this.apiBase + '/upload.php')`，
+    单纯抽字符串会得到两个互不相干的 `/api` 和 `/upload.php`，而真实入口是
+    `/api/upload.php`——a-04 的整条利用链就在这个拼接上。
+    """
+    bases = [r for r in routes if r.rstrip("/").count("/") <= 2
+             and r.rstrip("/").lower().endswith(("api", "api/v1", "v1", "v2", "admin"))]
+    out: list[str] = []
+    seen: set[str] = set()
+    for route in routes:
+        if route not in seen:
+            seen.add(route)
+            out.append(route)
+    for base in bases:
+        clean = base.rstrip("/")
+        for route in routes:
+            if route == base or route.startswith(clean + "/"):
+                continue
+            joined = clean + "/" + route.lstrip("/")
+            if joined not in seen:
+                seen.add(joined)
+                out.append(joined)
     return out[:limit]
 
 

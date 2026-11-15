@@ -238,15 +238,20 @@ def stub_solver(challenge: Challenge, started: StartResult) -> list[str]:
     return []
 
 
-def _accepts_submit(fn) -> bool:
-    """解题器是否接受 submit 回调。有就实时提交，拿平台反馈当信号。"""
+def _accepts_param(fn, name: str) -> bool:
+    """解题器是否接受指定关键字参数。"""
     try:
         params = inspect.signature(fn).parameters
     except (TypeError, ValueError):
         return False
-    if "submit" in params:
+    if name in params:
         return True
     return any(p.kind == p.VAR_KEYWORD for p in params.values())
+
+
+def _accepts_submit(fn) -> bool:
+    """解题器是否接受 submit 回调。有就实时提交，拿平台反馈当信号。"""
+    return _accepts_param(fn, "submit")
 
 
 def _idle_seconds() -> float:
@@ -414,10 +419,17 @@ def run_benchmark(solver: Callable[[Challenge, StartResult], list[str]] | None =
 
         try:
             task = _retry_challenge(challenge, pass_no)
+            # 平台客户端要单独给解题器：它里面有 get_hint，是拿官方提示的唯一途径。
+            # 之前只传 submit，解题器只能猜方向，一道题撞 25 步都撞不到点上。
+            kwargs: dict = {}
             if _accepts_submit(solver):
-                solver(task, started, submit=submit_one)
+                kwargs["submit"] = submit_one
+            if _accepts_param(solver, "bench_client"):
+                kwargs["bench_client"] = client
+            if kwargs.get("submit"):
+                solver(task, started, **kwargs)
             else:
-                for flag in list(solver(task, started) or []):
+                for flag in list(solver(task, started, **kwargs) or []):
                     submit_one(flag)
         except Exception as exc:  # noqa: BLE001
             bump("errors")

@@ -663,6 +663,120 @@ class UrlDedupeTest(unittest.TestCase):
                             and e.get("kind") == "这组 URL" for e in self.events))
 
 
+class UrlDedupeScopeTest(unittest.TestCase):
+    """同一 URL 换过滤条件再读，不算重复。
+
+    实跑 a-04 时模型反复读同一个 app.js，但每次 grep 的关键字不同（upload /
+    api_key / sed 区间），旧实现把它们全拦了——25 步里 10 步白扔，而且把真实
+    入口 /api/upload.php 记成「已排除」，直接把模型从正解上推开。
+    """
+
+    def setUp(self):
+        self.events = []
+        set_sink(self.events.append)
+
+    def tearDown(self):
+        set_sink(None)
+
+    def test_filtered_reads_of_same_url_are_allowed(self):
+        target = "http://127.0.0.1:1/assets/app.js"
+        cmds = [f"curl -sS -m 2 {target} | grep -i upload",
+                f"curl -sS -m 2 {target} | grep -i api_key",
+                f"curl -sS -m 2 {target} | sed -n '60,110p'"]
+        llm = FakeLLM([json.dumps({"cmd": c}) for c in cmds])
+        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
+                        llm, deadline=time.time() + 60, max_steps=3)
+        self.assertFalse([e for e in self.events
+                          if e["event"] == "solve_repeat_blocked"],
+                         "带过滤的再读被误拦了")
+
+    def test_pure_fetch_still_deduped(self):
+        """什么都不做的重复抓取还是要拦——那是真的没新信息。"""
+        target = "http://127.0.0.1:1/assets/app.js"
+        cmds = [f"curl -sS -m 2 {target}"] * 3
+        llm = FakeLLM([json.dumps({"cmd": c}) for c in cmds])
+        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
+                        llm, deadline=time.time() + 60, max_steps=3)
+        self.assertTrue([e for e in self.events
+                         if e["event"] == "solve_repeat_blocked"])
+
+
+class CandidatePriorityTest(unittest.TestCase):
+    """候选只取前 8 条，本题入口必须排在邻居端口前面。"""
+
+    def test_entry_port_candidates_come_first(self):
+        board = _board("10.0.0.1")
+        for port in ("18300", "18301", "18302", "18308"):
+            board.add(Fact("service", f"10.0.0.1:{port}",
+                           f"10.0.0.1:{port} http"))
+        board.add(Fact("entry", "entry:10.0.0.1:18308", "本题入口", "high"))
+        ids = [c.id for c in propose(board)]
+        self.assertTrue(any("18308" in item for item in ids), ids)
+
+
+class RcePivotTest(unittest.TestCase):
+    """拿到命令执行后必须马上转去找 flag。
+
+    实跑 a-04：第 10 步已经 `uid=33(www-data)`，之后 8 步还在重新上传 shell、
+    测 404 的文件名，而 /challenge/flag.txt 就摆在那里。
+    """
+
+    def setUp(self):
+        self.events = []
+        set_sink(self.events.append)
+
+    def tearDown(self):
+        set_sink(None)
+
+    def test_exec_proof_triggers_flag_hunt_hint(self):
+        llm = FakeLLM([
+            json.dumps({"cmd": "echo uid=33(www-data)"}),
+            json.dumps({"cmd": "echo next"}),
+        ])
+        ctx_prompts = []
+        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
+                        llm, deadline=time.time() + 30, max_steps=2)
+        ctx_prompts = llm.prompts
+        self.assertTrue(any(e["event"] == "solve_rce" for e in self.events))
+        self.assertTrue(any("/challenge/flag.txt" in p for p in ctx_prompts),
+                        "拿到执行后没有把 flag 常见位置推给模型")
+
+    def test_hint_appears_only_once(self):
+        llm = FakeLLM([json.dumps({"cmd": "id; echo uid=33(www-data)"}) for _ in range(4)])
+        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
+                        llm, deadline=time.time() + 30, max_steps=4)
+        self.assertEqual(len([e for e in self.events if e["event"] == "solve_rce"]), 1)
+
+
+class UploadMemoryTest(unittest.TestCase):
+    """上传成功要记成事实，模型自己会忘掉哪个文件名是活的。"""
+
+    def setUp(self):
+        self.events = []
+        set_sink(self.events.append)
+
+    def tearDown(self):
+        set_sink(None)
+
+    def test_uploaded_path_is_recorded(self):
+        resp = json.dumps({"cmd": "echo '{\"success\":true,\"path\":\"uploads/x.php7\"}'"})
+        llm = FakeLLM([resp])
+        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
+                        llm, deadline=time.time() + 30, max_steps=1)
+        recorded = [e for e in self.events if e["event"] == "solve_upload_recorded"]
+        self.assertTrue(recorded)
+        self.assertIn("uploads/x.php7", recorded[0]["url"])
+
+    def test_curl_26_gets_a_corrective_hint(self):
+        cmd = ("echo '(26) Failed to open/read local data from file/application'")
+        llm = FakeLLM([json.dumps({"cmd": cmd}),
+                       json.dumps({"cmd": "echo next"})])
+        solve_challenge(make_challenge(), StartResult("t-001", ["127.0.0.1:1"]),
+                        llm, deadline=time.time() + 30, max_steps=2)
+        self.assertTrue(any("printf" in p and "ls -l /tmp" in p for p in llm.prompts),
+                        "curl(26) 之后没有给出正确写法")
+
+
 class BreakerTest(unittest.TestCase):
     def setUp(self):
         self.events = []
@@ -798,6 +912,20 @@ class AttackFamilyTest(unittest.TestCase):
 
     def test_plain_recon_has_no_family(self):
         self.assertEqual(_attack_family("curl -sS http://h:80/"), ("", ""))
+
+    def test_reading_an_upload_endpoint_is_not_an_upload_attempt(self):
+        """a-04 的坑：读一次 /api/upload.php 被记成「上传绕过已排除」。"""
+        self.assertEqual(_attack_family("curl -sS http://h/api/upload.php"), ("", ""))
+
+    def test_multipart_really_is_an_upload_attempt(self):
+        self.assertEqual(
+            _attack_family("curl -F 'f=@a.png' -H 'X-API-Key: k' "
+                           "http://h/api/upload.php")[0], "上传绕过")
+
+    def test_shell_variable_path_is_not_recorded(self):
+        family, path = _attack_family("for p in a; do curl -F x http://h/$p; done")
+        self.assertEqual(family, "上传绕过")
+        self.assertEqual(path, "", "变量路径不能当真实路径记账")
 
     def test_failed_family_is_named_in_next_prompt(self):
         with _Server() as srv:
